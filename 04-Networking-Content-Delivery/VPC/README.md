@@ -371,19 +371,561 @@ aws ec2 create-flow-logs \
 3. Check route table tem rota para IGW
 4. Verify Security Group permite outbound
 5. Check NACL permite outbound e inbound return
+6. Verify instance tem public IP ou Elastic IP
+7. Check se não há blackhole routes
 
 ### Não consegue SSH
 1. Verify Security Group permite port 22
-2. Check NACL
+2. Check NACL permite porta 22 inbound e ephemeral ports (1024-65535) outbound
 3. Verify key pair correto
 4. Check se instance tem public IP (se em public subnet)
 5. Verify instance está running
+6. Check route table
+7. Considere usar Session Manager como alternativa
 
 ### VPC Peering não funciona
 1. Check CIDRs não sobrepõem
 2. Verify route tables em ambas VPCs
-3. Check Security Groups
+3. Check Security Groups referencing peered VPC
 4. Verify peering connection accepted
+5. Check NACLs em ambos os lados
+6. Verify DNS resolution habilitado se necessário
+
+### Problemas com DNS
+1. Verify DNS resolution e DNS hostnames habilitados
+2. Check Route 53 Private Hosted Zone associations
+3. Verify DHCP Options Set correto
+4. Check se VPC Endpoints precisam de private DNS
+
+### NAT Gateway não funciona
+1. Check NAT Gateway está em public subnet
+2. Verify Elastic IP associado ao NAT Gateway
+3. Check route table da private subnet aponta para NAT Gateway
+4. Verify Security Groups e NACLs
+5. Check limites de conexões concorrentes (55.000 por NAT Gateway)
+
+## Perguntas e Respostas (Q&A)
+
+### Conceitos Fundamentais
+
+**P: Qual CIDR devo usar para minha VPC?**
+R: Recomendações:
+- **Pequena empresa/dev**: 10.0.0.0/16 (65.536 IPs)
+- **Média empresa**: 172.16.0.0/12 (1.048.576 IPs)
+- **Grande empresa**: 10.0.0.0/8 (16.777.216 IPs)
+
+Evite conflitos com:
+- Redes on-premises
+- Outras VPCs que precisará fazer peering
+- Redes parceiras
+
+**P: Diferença entre Security Group e NACL?**
+R:
+| Característica | Security Group | NACL |
+|----------------|----------------|------|
+| **Nível** | Instance (ENI) | Subnet |
+| **Estado** | Stateful | Stateless |
+| **Regras** | Apenas Allow | Allow e Deny |
+| **Retorno** | Automático | Manual |
+| **Ordem** | Todas aplicadas | Por número |
+| **Default** | Deny all inbound | Allow all |
+
+Use ambos para defense in depth!
+
+**P: Quantas subnets devo criar?**
+R: Arquitetura típica:
+- **2 Public subnets**: Uma em cada AZ para ALB, NAT Gateway, Bastion
+- **2 Private subnets**: Uma em cada AZ para aplicações
+- **2 Database subnets**: Uma em cada AZ para databases isolados
+
+Mínimo: 2 AZs para alta disponibilidade
+Ideal: 3 AZs para máxima resiliência
+
+**P: Como calcular tamanhos de subnet?**
+R: AWS reserva 5 IPs por subnet:
+- .0: Network address
+- .1: VPC router
+- .2: DNS server
+- .3: Reservado para uso futuro
+- .255: Network broadcast
+
+Exemplo /24 (256 IPs):
+- 256 - 5 = 251 IPs utilizáveis
+- /28 (16 IPs) = 11 utilizáveis
+- /20 (4.096 IPs) = 4.091 utilizáveis
+
+**P: Posso mudar o CIDR da VPC depois de criada?**
+R: Não pode mudar o CIDR primário, mas pode:
+- Adicionar CIDRs secundários (até 4 adicionais)
+- CIDRs secundários devem ser do mesmo tamanho ou maiores
+- Útil quando precisa expandir VPC sem recriar
+
+### Internet Gateway vs NAT
+
+**P: Quando usar Internet Gateway vs NAT Gateway?**
+R:
+- **Internet Gateway**: Para recursos que PRECISAM ser acessados da internet (public subnets). Comunicação bidirecional.
+- **NAT Gateway**: Para recursos que só precisam ACESSAR a internet, mas não ser acessados (private subnets). Comunicação unidirecional (outbound only).
+
+**P: NAT Gateway vs NAT Instance - qual usar?**
+R:
+**NAT Gateway** (recomendado):
+- ✅ Managed, sem manutenção
+- ✅ Alta disponibilidade em AZ
+- ✅ Até 45 Gbps bandwidth
+- ✅ Scaling automático
+- ❌ Custo: $0.045/hora + $0.045/GB processado
+
+**NAT Instance**:
+- ✅ Mais barato (~$0.01/hora t3.nano)
+- ✅ Pode usar como bastion também
+- ✅ Pode customizar
+- ❌ Você gerencia
+- ❌ Single point of failure
+- ❌ Bandwidth limitado ao tipo de instância
+
+**P: Preciso de um NAT Gateway por AZ?**
+R: Para alta disponibilidade, SIM. Se NAT Gateway falhar ou AZ ficar indisponível, instances na outra AZ ficarão sem internet. Custo extra vale a pena para produção.
+
+### VPC Peering
+
+**P: VPC Peering é transitivo?**
+R: Não! Se VPC-A peer com VPC-B, e VPC-B peer com VPC-C, VPC-A NÃO pode comunicar com VPC-C. Você precisa criar peering direto entre A e C.
+
+**P: Quantos VPC Peerings posso ter?**
+R: Limite padrão: 125 peerings por VPC (pode aumentar até 125). Para muitas VPCs, considere AWS Transit Gateway.
+
+**P: Posso fazer peering entre regiões?**
+R: Sim! Inter-Region VPC Peering suporta:
+- Peering entre qualquer região comercial AWS
+- Tráfego criptografado
+- Sem bandwidth bottleneck
+- Latência consistente
+
+Limitações:
+- Não suporta IPv6
+- Não suporta security group referencing cross-region
+
+**P: VPC Peering vs Transit Gateway vs AWS PrivateLink?**
+R:
+- **VPC Peering**: Para poucos VPCs, comunicação full mesh
+- **Transit Gateway**: Hub central para muitos VPCs (>10), simplifica topologia
+- **PrivateLink**: Para expor serviços específicos, sem expor toda VPC
+
+### Endpoints e PrivateLink
+
+**P: Interface Endpoint vs Gateway Endpoint?**
+R:
+**Gateway Endpoint** (free):
+- Apenas S3 e DynamoDB
+- Usa route table
+- Sem custo adicional
+- Não usa IP da subnet
+
+**Interface Endpoint** (~$0.01/hora):
+- Qualquer serviço AWS suportado
+- Usa ENI na subnet
+- Usa PrivateLink
+- Cobra por endpoint e por GB
+
+**P: Quando usar VPC Endpoints?**
+R: Use quando:
+- Quer acesso privado a serviços AWS (sem internet)
+- Compliance requer tráfego não sair da AWS network
+- Quer economizar em NAT Gateway data transfer
+- Precisa de baixa latência
+
+Exemplo: Lambda em VPC acessando S3 via Gateway Endpoint economiza em NAT Gateway.
+
+### Segurança
+
+**P: Como implementar bastion host seguro?**
+R: Melhores práticas:
+1. Use em public subnet
+2. Security Group restrito (apenas seu IP)
+3. Use Systems Manager Session Manager (sem SSH)
+4. Se usar SSH, use key-based auth + MFA
+5. Desabilite password auth
+6. Configure audit logging
+7. Use Auto Scaling Group (min=0, max=1) para on-demand
+8. Considere AWS Client VPN como alternativa
+
+**P: Como proteger databases em VPC?**
+R:
+1. Sempre em private subnet
+2. Security Group permite apenas application tier
+3. Use separate database subnet group
+4. Encryption at rest (KMS)
+5. Encryption in transit (SSL/TLS)
+6. VPC Flow Logs habilitado
+7. Use RDS Proxy para connection pooling
+8. Backups automáticos para subnet diferente
+
+**P: O que são VPC Flow Logs?**
+R: Logs de tráfego de rede capturando:
+- Source/destination IP e port
+- Protocol
+- Action (ACCEPT/REJECT)
+- Bytes e packets
+
+Útil para:
+- Security analysis
+- Troubleshooting connectivity
+- Compliance
+- Traffic analytics
+
+Custo: Storage (S3 ou CloudWatch Logs) + ingest
+
+### Híbrido e Conectividade
+
+**P: VPN vs Direct Connect - qual usar?**
+R:
+**VPN** (~$0.05/hora):
+- ✅ Setup rápido (minutos)
+- ✅ Baixo custo
+- ✅ Criptografia IPsec
+- ❌ Internet-dependent
+- ❌ Variável latência/bandwidth
+- Use para: Dev/test, disaster recovery, temporary
+
+**Direct Connect** (~$0.30/hora + port fees):
+- ✅ Dedicado, consistente performance
+- ✅ Baixa latência
+- ✅ Até 100 Gbps
+- ❌ Setup lento (semanas/meses)
+- ❌ Caro
+- Use para: Produção, high bandwidth, low latency
+
+**Melhor**: Usar ambos - Direct Connect para produção, VPN como backup.
+
+**P: O que é AWS Transit Gateway?**
+R: Hub central que simplifica conectividade:
+- Conecta milhares de VPCs
+- Conecta on-premises via VPN ou Direct Connect
+- Uma rota table central
+- Suporta multicast
+- Peering entre regions
+
+Use quando:
+- >10 VPCs
+- Arquitetura hub-and-spoke desejada
+- Simplificar gerenciamento de rotas
+
+### Custos
+
+**P: O que é cobrado em VPC?**
+R: VPC em si é grátis! Cobranças:
+- **NAT Gateway**: $0.045/hora + $0.045/GB
+- **VPC Endpoints**: $0.01/hora + $0.01/GB (Interface)
+- **VPN**: $0.05/hora por connection
+- **Transit Gateway**: $0.05/hora + $0.02/GB
+- **Data Transfer**: OUT para internet
+- **Elastic IPs**: Se não associado
+
+**P: Como reduzir custos de VPC?**
+R:
+1. Use Gateway Endpoints (S3, DynamoDB) - free
+2. Delete NAT Gateways em dev/test quando não usar
+3. Use single NAT Gateway (não HA) para dev/test
+4. Use VPC Endpoints ao invés de NAT para serviços AWS
+5. Compress data antes de transfer
+6. Delete unused Elastic IPs
+7. Right-size VPN e Direct Connect
+
+## Exemplos Avançados
+
+### Exemplo 1: VPC Completa com Terraform
+
+```hcl
+# Main VPC
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "production-vpc"
+  }
+}
+
+# Public Subnets
+resource "aws_subnet" "public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.${count.index}.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "public-subnet-${count.index + 1}"
+    Tier = "Public"
+  }
+}
+
+# Private Subnets (Application)
+resource "aws_subnet" "private_app" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index + 10}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "private-app-subnet-${count.index + 1}"
+    Tier = "Private-App"
+  }
+}
+
+# Private Subnets (Database)
+resource "aws_subnet" "private_db" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index + 20}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "private-db-subnet-${count.index + 1}"
+    Tier = "Private-DB"
+  }
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "main-igw"
+  }
+}
+
+# Elastic IPs for NAT Gateways
+resource "aws_eip" "nat" {
+  count  = 2
+  domain = "vpc"
+
+  tags = {
+    Name = "nat-eip-${count.index + 1}"
+  }
+}
+
+# NAT Gateways (one per AZ for HA)
+resource "aws_nat_gateway" "main" {
+  count         = 2
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "nat-gateway-${count.index + 1}"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+# Route Table for Public Subnets
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "public-route-table"
+  }
+}
+
+# Route Tables for Private Subnets (one per AZ)
+resource "aws_route_table" "private" {
+  count  = 2
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = {
+    Name = "private-route-table-${count.index + 1}"
+  }
+}
+
+# Route Table Associations
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private_app" {
+  count          = 2
+  subnet_id      = aws_subnet.private_app[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+resource "aws_route_table_association" "private_db" {
+  count          = 2
+  subnet_id      = aws_subnet.private_db[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# VPC Endpoints
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id       = aws_vpc.main.id
+  service_name = "com.amazonaws.${var.region}.s3"
+  
+  route_table_ids = concat(
+    [aws_route_table.public.id],
+    aws_route_table.private[*].id
+  )
+
+  tags = {
+    Name = "s3-gateway-endpoint"
+  }
+}
+
+# Security Groups
+resource "aws_security_group" "alb" {
+  name        = "alb-security-group"
+  description = "Security group for Application Load Balancer"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "alb-sg"
+  }
+}
+
+resource "aws_security_group" "app" {
+  name        = "app-security-group"
+  description = "Security group for application tier"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "app-sg"
+  }
+}
+
+resource "aws_security_group" "db" {
+  name        = "db-security-group"
+  description = "Security group for database tier"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "db-sg"
+  }
+}
+
+# VPC Flow Logs
+resource "aws_flow_log" "main" {
+  iam_role_arn    = aws_iam_role.flow_logs.arn
+  log_destination = aws_cloudwatch_log_group.flow_logs.arn
+  traffic_type    = "ALL"
+  vpc_id          = aws_vpc.main.id
+
+  tags = {
+    Name = "vpc-flow-logs"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "flow_logs" {
+  name              = "/aws/vpc/flow-logs"
+  retention_in_days = 30
+}
+
+# Network ACLs (additional security layer)
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.public[*].id
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 80
+    to_port    = 80
+  }
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 110
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 120
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  egress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  tags = {
+    Name = "public-nacl"
+  }
+}
+```
 
 ## Recursos de Aprendizado
 
@@ -391,3 +933,6 @@ aws ec2 create-flow-logs \
 - [VPC Networking Components](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Networking.html)
 - [VPC Security Best Practices](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-best-practices.html)
 - [CIDR Calculator](https://www.ipaddressguide.com/cidr)
+- [AWS VPC Workshop](https://networking.workshop.aws/)
+- [VPC Design Patterns](https://aws.amazon.com/blogs/networking-and-content-delivery/)
+- [AWS re:Invent VPC Sessions](https://www.youtube.com/results?search_query=reinvent+vpc)

@@ -771,6 +771,495 @@ def lambda_handler(event, context):
 ### P: Como lidar com muitas conexões?
 **R:** 1) Implement connection pooling na app, 2) Use RDS Proxy, 3) Right-size instance (mais RAM = mais conexões), 4) Monitor connections no CloudWatch, 5) Configure max_connections adequadamente, 6) Considere scaling vertical se necessário.
 
+## Troubleshooting Comum
+
+### Alto CPU Utilization
+**Problema**: CPU consistentemente acima de 80%
+**Soluções**:
+- Identificar queries lentas com Performance Insights
+- Otimizar queries e adicionar índices
+- Enable Query Cache (MySQL/MariaDB)
+- Scale up para instance maior
+- Implement read replicas para distribuir reads
+- Verificar se não há connections ociosas consumindo recursos
+
+### Storage Full
+**Problema**: Database ficando sem espaço
+**Soluções**:
+- Enable storage auto scaling
+- Increase allocated storage manualmente
+- Purge old data (archives, logs)
+- Analyze table sizes com queries
+- Optimize tables (OPTIMIZE TABLE no MySQL)
+- Implement data lifecycle policies
+
+### Connection Timeouts
+**Problema**: Aplicação não consegue conectar
+**Soluções**:
+- Verificar Security Group permite porta do database
+- Check NACL rules
+- Verify database está available (não em maintenance)
+- Check connection string correto
+- Verify VPC e subnet configuration
+- Test conectividade com telnet ou nc
+- Check se não atingiu max_connections
+- Use RDS Proxy para melhor connection management
+
+### Replication Lag
+**Problema**: Read replica atrasada
+**Soluções**:
+- Check ReplicaLag metric no CloudWatch
+- Upgrade read replica instance type
+- Reduce write load no primary
+- Check network latency (cross-region)
+- Verify binlog format (MIXED ou ROW recomendado)
+- Consider promoting replica a standalone se lag persistente
+
+### Backup Falhas
+**Problema**: Automated backups falhando
+**Soluções**:
+- Check retention period configurado
+- Verify backup window não conflita com maintenance
+- Check storage available
+- Verify IAM permissions
+- Review DB logs para erro específico
+- Contact AWS Support se persistir
+
+## Exemplos Avançados
+
+### Exemplo 1: Setup Completo com Terraform
+
+```hcl
+# RDS Subnet Group
+resource "aws_db_subnet_group" "main" {
+  name       = "main-db-subnet-group"
+  subnet_ids = var.private_subnet_ids
+
+  tags = {
+    Name = "Main DB Subnet Group"
+  }
+}
+
+# RDS Parameter Group (MySQL optimized)
+resource "aws_db_parameter_group" "mysql" {
+  name   = "production-mysql-params"
+  family = "mysql8.0"
+
+  parameter {
+    name  = "max_connections"
+    value = "500"
+  }
+
+  parameter {
+    name  = "slow_query_log"
+    value = "1"
+  }
+
+  parameter {
+    name  = "long_query_time"
+    value = "2"
+  }
+
+  parameter {
+    name  = "log_queries_not_using_indexes"
+    value = "1"
+  }
+
+  parameter {
+    name  = "innodb_buffer_pool_size"
+    value = "{DBInstanceClassMemory*3/4}"
+  }
+}
+
+# RDS Security Group
+resource "aws_security_group" "rds" {
+  name        = "rds-security-group"
+  description = "Security group for RDS MySQL"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [var.app_security_group_id]
+    description     = "MySQL access from application"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "rds-sg"
+  }
+}
+
+# RDS Master Instance (Multi-AZ)
+resource "aws_db_instance" "master" {
+  identifier     = "production-mysql-master"
+  engine         = "mysql"
+  engine_version = "8.0.35"
+  instance_class = "db.r6g.2xlarge"
+
+  # Storage
+  allocated_storage     = 500
+  max_allocated_storage = 2000  # Auto scaling até 2TB
+  storage_type          = "gp3"
+  iops                  = 12000
+  storage_encrypted     = true
+  kms_key_id            = var.kms_key_arn
+
+  # Database
+  db_name  = "production"
+  username = "admin"
+  password = var.db_password  # Use Secrets Manager
+
+  # Networking
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  publicly_accessible    = false
+
+  # High Availability
+  multi_az               = true
+  availability_zone      = null  # Auto choose when multi_az = true
+
+  # Parameters
+  parameter_group_name = aws_db_parameter_group.mysql.name
+
+  # Backups
+  backup_retention_period = 30
+  backup_window           = "03:00-04:00"
+  copy_tags_to_snapshot   = true
+  delete_automated_backups = false
+  skip_final_snapshot     = false
+  final_snapshot_identifier = "production-mysql-final-snapshot-${formatdate("YYYY-MM-DD-hhmm", timestamp())}"
+
+  # Maintenance
+  maintenance_window         = "sun:04:00-sun:05:00"
+  auto_minor_version_upgrade = true
+
+  # Monitoring
+  enabled_cloudwatch_logs_exports = ["error", "general", "slowquery"]
+  performance_insights_enabled    = true
+  performance_insights_retention_period = 7
+  monitoring_interval = 60
+  monitoring_role_arn = aws_iam_role.rds_monitoring.arn
+
+  # Protection
+  deletion_protection = true
+
+  tags = {
+    Name        = "production-mysql-master"
+    Environment = "production"
+  }
+}
+
+# Read Replica (Same Region)
+resource "aws_db_instance" "replica" {
+  identifier     = "production-mysql-replica"
+  replicate_source_db = aws_db_instance.master.identifier
+  instance_class = "db.r6g.xlarge"
+
+  # Can override storage
+  max_allocated_storage = 1000
+
+  # Must be same or larger than source
+  allocated_storage = 500
+
+  # Auto minor version upgrades disabled for replicas
+  auto_minor_version_upgrade = false
+
+  # Monitoring
+  performance_insights_enabled = true
+  monitoring_interval          = 60
+  monitoring_role_arn          = aws_iam_role.rds_monitoring.arn
+
+  tags = {
+    Name        = "production-mysql-replica"
+    Environment = "production"
+  }
+}
+
+# Cross-Region Read Replica (DR)
+resource "aws_db_instance" "replica_dr" {
+  provider       = aws.us-west-2  # Different region
+  identifier     = "production-mysql-replica-dr"
+  replicate_source_db = aws_db_instance.master.arn  # Cross-region needs ARN
+
+  instance_class = "db.r6g.xlarge"
+  storage_encrypted = true
+
+  # New subnet group in DR region
+  db_subnet_group_name = aws_db_subnet_group.dr.name
+
+  tags = {
+    Name        = "production-mysql-replica-dr"
+    Environment = "production-dr"
+  }
+}
+
+# IAM Role for Enhanced Monitoring
+resource "aws_iam_role" "rds_monitoring" {
+  name = "rds-enhanced-monitoring-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "monitoring.rds.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
+# CloudWatch Alarms
+resource "aws_cloudwatch_metric_alarm" "database_cpu" {
+  alarm_name          = "rds-cpu-utilization-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This metric monitors RDS CPU utilization"
+  alarm_actions       = [var.sns_topic_arn]
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.master.id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "database_storage" {
+  alarm_name          = "rds-storage-space-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "FreeStorageSpace"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "10737418240"  # 10 GB in bytes
+  alarm_description   = "RDS storage space is running low"
+  alarm_actions       = [var.sns_topic_arn]
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.master.id
+  }
+}
+```
+
+### Exemplo 2: Automation Scripts Python
+
+```python
+import boto3
+import time
+from datetime import datetime, timedelta
+
+class RDSManager:
+    def __init__(self, region='us-east-1'):
+        self.rds = boto3.client('rds', region_name=region)
+        self.cloudwatch = boto3.client('cloudwatch', region_name=region)
+    
+    def create_manual_snapshot(self, db_identifier):
+        """Cria snapshot manual com timestamp"""
+        snapshot_id = f"{db_identifier}-manual-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        
+        print(f"Criando snapshot: {snapshot_id}")
+        response = self.rds.create_db_snapshot(
+            DBSnapshotIdentifier=snapshot_id,
+            DBInstanceIdentifier=db_identifier,
+            Tags=[
+                {'Key': 'Type', 'Value': 'Manual'},
+                {'Key': 'CreatedBy', 'Value': 'AutomationScript'}
+            ]
+        )
+        
+        return snapshot_id
+    
+    def wait_for_snapshot(self, snapshot_id, timeout=3600):
+        """Aguarda snapshot ficar disponível"""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            response = self.rds.describe_db_snapshots(
+                DBSnapshotIdentifier=snapshot_id
+            )
+            
+            status = response['DBSnapshots'][0]['Status']
+            print(f"Snapshot status: {status}")
+            
+            if status == 'available':
+                return True
+            elif status == 'failed':
+                raise Exception("Snapshot failed")
+            
+            time.sleep(30)
+        
+        raise Exception("Snapshot timeout")
+    
+    def copy_snapshot_to_region(self, source_snapshot, target_region):
+        """Copia snapshot para outra região (DR)"""
+        rds_target = boto3.client('rds', region_name=target_region)
+        
+        source_arn = f"arn:aws:rds:us-east-1:123456789012:snapshot:{source_snapshot}"
+        target_snapshot = f"{source_snapshot}-{target_region}"
+        
+        print(f"Copiando {source_snapshot} para {target_region}")
+        response = rds_target.copy_db_snapshot(
+            SourceDBSnapshotIdentifier=source_arn,
+            TargetDBSnapshotIdentifier=target_snapshot,
+            CopyTags=True,
+            Tags=[
+                {'Key': 'BackupType', 'Value': 'DR'},
+                {'Key': 'SourceRegion', 'Value': 'us-east-1'}
+            ]
+        )
+        
+        return target_snapshot
+    
+    def cleanup_old_snapshots(self, db_identifier, retention_days=30):
+        """Remove snapshots manuais antigos"""
+        cutoff_date = datetime.now() - timedelta(days=retention_days)
+        
+        response = self.rds.describe_db_snapshots(
+            DBInstanceIdentifier=db_identifier,
+            SnapshotType='manual'
+        )
+        
+        deleted = 0
+        for snapshot in response['DBSnapshots']:
+            snapshot_time = snapshot['SnapshotCreateTime'].replace(tzinfo=None)
+            
+            if snapshot_time < cutoff_date:
+                snapshot_id = snapshot['DBSnapshotIdentifier']
+                print(f"Deletando snapshot antigo: {snapshot_id}")
+                
+                self.rds.delete_db_snapshot(
+                    DBSnapshotIdentifier=snapshot_id
+                )
+                deleted += 1
+        
+        print(f"Total de snapshots deletados: {deleted}")
+        return deleted
+    
+    def get_performance_metrics(self, db_identifier, hours=24):
+        """Analisa métricas de performance"""
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=hours)
+        
+        metrics = {
+            'CPUUtilization': [],
+            'DatabaseConnections': [],
+            'ReadLatency': [],
+            'WriteLatency': [],
+            'FreeableMemory': []
+        }
+        
+        for metric_name in metrics.keys():
+            response = self.cloudwatch.get_metric_statistics(
+                Namespace='AWS/RDS',
+                MetricName=metric_name,
+                Dimensions=[
+                    {'Name': 'DBInstanceIdentifier', 'Value': db_identifier}
+                ],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=3600,  # 1 hora
+                Statistics=['Average', 'Maximum']
+            )
+            
+            if response['Datapoints']:
+                avg = sum(p['Average'] for p in response['Datapoints']) / len(response['Datapoints'])
+                max_val = max(p['Maximum'] for p in response['Datapoints'])
+                
+                metrics[metric_name] = {
+                    'average': round(avg, 2),
+                    'maximum': round(max_val, 2)
+                }
+        
+        return metrics
+    
+    def promote_read_replica(self, replica_identifier):
+        """Promove read replica a standalone (DR failover)"""
+        print(f"Promovendo replica: {replica_identifier}")
+        
+        response = self.rds.promote_read_replica(
+            DBInstanceIdentifier=replica_identifier,
+            BackupRetentionPeriod=30
+        )
+        
+        # Aguardar promoção completar
+        waiter = self.rds.get_waiter('db_instance_available')
+        waiter.wait(DBInstanceIdentifier=replica_identifier)
+        
+        print(f"Replica promovida com sucesso: {replica_identifier}")
+        return True
+    
+    def modify_instance(self, db_identifier, instance_class=None, 
+                       allocated_storage=None, iops=None, apply_immediately=False):
+        """Modifica configuração da instância"""
+        modify_params = {
+            'DBInstanceIdentifier': db_identifier,
+            'ApplyImmediately': apply_immediately
+        }
+        
+        if instance_class:
+            modify_params['DBInstanceClass'] = instance_class
+            print(f"Mudando instance class para: {instance_class}")
+        
+        if allocated_storage:
+            modify_params['AllocatedStorage'] = allocated_storage
+            print(f"Aumentando storage para: {allocated_storage} GB")
+        
+        if iops:
+            modify_params['Iops'] = iops
+            print(f"Ajustando IOPS para: {iops}")
+        
+        response = self.rds.modify_db_instance(**modify_params)
+        
+        if apply_immediately:
+            print("Modificações serão aplicadas imediatamente")
+        else:
+            print("Modificações serão aplicadas na próxima maintenance window")
+        
+        return response
+
+# Uso
+manager = RDSManager(region='us-east-1')
+
+# Snapshot e DR
+snapshot_id = manager.create_manual_snapshot('production-db')
+manager.wait_for_snapshot(snapshot_id)
+manager.copy_snapshot_to_region(snapshot_id, 'us-west-2')
+manager.cleanup_old_snapshots('production-db', retention_days=30)
+
+# Performance analysis
+metrics = manager.get_performance_metrics('production-db', hours=24)
+print(f"Métricas: {metrics}")
+
+# Scaling
+if metrics['CPUUtilization']['average'] > 70:
+    print("High CPU detected, scaling up...")
+    manager.modify_instance(
+        'production-db',
+        instance_class='db.r6g.4xlarge',
+        apply_immediately=False
+    )
+
+# DR Failover (quando necessário)
+# manager.promote_read_replica('production-db-replica-dr')
+```
+
 ## Recursos de Aprendizado
 
 - [RDS Documentation](https://docs.aws.amazon.com/rds/)
@@ -778,3 +1267,5 @@ def lambda_handler(event, context):
 - [RDS FAQ](https://aws.amazon.com/rds/faqs/)
 - [AWS re:Invent RDS Sessions](https://www.youtube.com/results?search_query=reinvent+rds)
 - [RDS Pricing](https://aws.amazon.com/rds/pricing/)
+- [RDS Workshop](https://catalog.us-east-1.prod.workshops.aws/workshops/d0e1b7d1-4b1e-4a5b-a8a1-f2b1c9f7d5e8/)
+- [Database Migration Guide](https://aws.amazon.com/dms/)

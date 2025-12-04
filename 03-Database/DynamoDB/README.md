@@ -502,9 +502,725 @@ aws dynamodb update-table \
 - High user errors
 - Capacity utilization > 80%
 
+## Troubleshooting Comum
+
+### ProvisionedThroughputExceededException
+**Problema**: Throttling de requests
+**Soluções**:
+- Habilitar Auto Scaling
+- Aumentar WCUs/RCUs provisionados
+- Mudar para On-Demand mode
+- Implementar exponential backoff
+- Distribuir carga uniformemente (evitar hot partitions)
+- Usar cache (DAX)
+
+### ValidationException
+**Problema**: Erro de validação em operações
+**Soluções**:
+- Verificar tipos de dados (String, Number, Binary)
+- Confirmar que chaves estão corretas
+- Validar expression syntax
+- Verificar tamanho do item (max 400 KB)
+
+### ItemCollectionSizeLimitExceededException
+**Problema**: Collection size > 10 GB
+**Soluções**:
+- Redesenhar partition key para melhor distribuição
+- Usar composite keys diferentes
+- Considerar múltiplas tabelas
+- Remover dados desnecessários
+
+### ConditionalCheckFailedException
+**Problema**: Condição de escrita falhou
+**Soluções**:
+- Verificar se condition expression está correta
+- Confirmar que item existe (para updates)
+- Implementar retry logic se apropriado
+- Usar transactions se precisa de atomicidade
+
+## Perguntas e Respostas (Q&A)
+
+### Conceitos Fundamentais
+
+**P: Quando devo usar DynamoDB vs RDS?**
+R: Use DynamoDB quando:
+- Precisa de escala horizontal massiva (milhões de requests/segundo)
+- Latência consistente de milissegundos é crítica
+- Modelo serverless é preferido
+- Schema flexível é necessário
+- Carga de trabalho é key-value ou document-based
+
+Use RDS quando:
+- Precisa de queries SQL complexas com JOINs
+- ACID transactions são críticas
+- Schema relacional bem definido
+- Já tem aplicação SQL existente
+- Ferramentas de BI precisam conectar diretamente
+
+**P: Como funciona o partitioning no DynamoDB?**
+R: DynamoDB usa a partition key para distribuir dados. Hash da partition key determina em qual partition física o item é armazenado. Por isso é crucial escolher uma partition key com alta cardinalidade para distribuir carga uniformemente.
+
+**P: Diferença entre partition key e sort key?**
+R: 
+- Partition key (hash key): Determina a partition onde o item é armazenado
+- Sort key (range key): Ordena items dentro da mesma partition
+- Juntas formam uma composite primary key
+- Partition key sozinha = simple primary key
+
+**P: DynamoDB é eventually consistent ou strongly consistent?**
+R: Por padrão é eventually consistent (mais rápido, usa menos RCUs). Você pode solicitar strongly consistent reads quando necessário, mas isso usa 2x mais RCUs e tem latência ligeiramente maior.
+
+### Modelagem de Dados
+
+**P: Devo usar single table design ou múltiplas tabelas?**
+R: Single table design é recomendado para:
+- Aplicações complexas com múltiplas entidades relacionadas
+- Quando precisa de queries eficientes entre entidades
+- Para minimizar custos (menos tabelas = menos WCUs/RCUs totais)
+
+Múltiplas tabelas fazem sentido para:
+- Aplicações simples com entidades independentes
+- Quando equipes diferentes gerenciam diferentes dados
+- Para compliance/segurança (separação de dados sensíveis)
+
+**P: Como fazer JOINs no DynamoDB?**
+R: DynamoDB não tem JOINs nativos. Estratégias:
+1. Denormalizar dados (duplicar onde necessário)
+2. Usar single table design com composite keys
+3. Fazer múltiplas queries na aplicação
+4. Usar adjacency list pattern
+5. Usar GSIs para diferentes access patterns
+
+**P: Como escolher uma boa partition key?**
+R: Características de uma boa partition key:
+- Alta cardinalidade (muitos valores únicos)
+- Distribuição uniforme de acesso
+- Não concentra hot spots
+- Permite queries eficientes
+
+Exemplos:
+- ✅ BOM: userId, orderId, deviceId
+- ❌ RUIM: status (poucos valores), country (hot spots), date (acesso recente concentrado)
+
+**P: Quantos GSIs devo criar?**
+R: Crie um GSI para cada access pattern diferente que sua aplicação precisa. Máximo 20 GSIs por tabela. Considere:
+- Cada GSI tem custo (storage + throughput)
+- GSIs aumentam latência de writes (eventual consistency)
+- Sparse indexes (GSIs com subset de items) são eficientes
+
+### Performance e Custos
+
+**P: On-Demand vs Provisioned - qual escolher?**
+R: 
+**On-Demand**: 
+- Workloads imprevisíveis ou spiky
+- Novas tabelas sem histórico
+- Aplicações que aceitam até 2.5x custo extra
+- Quando não quer gerenciar capacidade
+
+**Provisioned**:
+- Workloads previsíveis e consistentes
+- Alto volume (mais cost-effective)
+- Pode usar Reserved Capacity
+- Com Auto Scaling bem configurado
+
+**P: Como calcular RCUs e WCUs necessários?**
+R: 
+**WCUs**: 1 WCU = 1 write de até 1 KB/segundo
+- Item 3.5 KB = 4 WCUs
+- 100 writes/segundo de 2 KB = 200 WCUs
+
+**RCUs** (strongly consistent): 1 RCU = 1 read de até 4 KB/segundo
+- Item 10 KB = 3 RCUs
+- 100 reads/segundo de 5 KB = 200 RCUs
+
+**RCUs** (eventually consistent): 2 reads por RCU
+- 100 reads/segundo de 5 KB = 100 RCUs
+
+**P: DAX vale a pena? Quando usar?**
+R: Use DAX quando:
+- Workload read-heavy (>80% reads)
+- Precisa de latência de microsegundos
+- Muitas queries repetidas
+- Pode tolerar eventually consistent data
+- Custo adicional é aceitável ($0.12/hora por nó small)
+
+Não use se:
+- Workload write-heavy
+- Dados mudam muito frequentemente
+- Strongly consistent reads são críticos
+- Budget limitado
+
+**P: Como reduzir custos no DynamoDB?**
+R: 
+1. Use on-demand apenas se realmente necessário
+2. Configure Auto Scaling em provisioned mode
+3. Use Reserved Capacity (1-3 anos, até 77% desconto)
+4. Delete GSIs não utilizados
+5. Implemente TTL para cleanup automático
+6. Use projection expressions (buscar apenas campos necessários)
+7. Batch operations quando possível
+8. Comprima large attributes
+9. Use eventually consistent reads quando apropriado
+10. Archive dados antigos para S3
+
+### Transações e Consistência
+
+**P: DynamoDB Transactions são ACID compliant?**
+R: Sim, transactions (TransactWriteItems/TransactReadItems) são ACID:
+- Atomicidade: Todas operações succedem ou falham juntas
+- Consistência: Constraints são mantidas
+- Isolamento: Serializable isolation
+- Durabilidade: Writes são persistentes
+
+Limitações: Max 100 items, 4 MB total, custo 2x dos writes normais
+
+**P: Como implementar contador atômico?**
+R: Use UpdateExpression com ADD:
+
+```python
+table.update_item(
+    Key={'userId': '12345'},
+    UpdateExpression='ADD views :inc',
+    ExpressionAttributeValues={':inc': 1}
+)
+```
+
+Isso é atômico mesmo com requests concorrentes.
+
+**P: Como garantir idempotência em writes?**
+R: Estratégias:
+1. Use conditional writes com chave de idempotência
+2. Use transactions
+3. Gere IDs únicos (UUIDs) no client
+4. Implemente deduplication window
+5. Use version numbers ou timestamps
+
+### Streams e Eventos
+
+**P: DynamoDB Streams vs Kinesis Data Streams?**
+R: 
+**DynamoDB Streams**:
+- Integrado nativamente
+- 24 horas de retenção
+- Não requer capacity planning
+- Free (limitado a 2 readers simultâneos)
+
+**Kinesis Data Streams para DynamoDB**:
+- Até 1 ano de retenção
+- Mais de 2 consumidores paralelos
+- Integração com Kinesis ecosystem
+- Custo adicional
+
+**P: Como processar DynamoDB Streams com Lambda?**
+R: Lambda processa Streams em batches:
+- Polling automático
+- Batch size configurável (1-10000 records)
+- Retry automático em falhas
+- Dead Letter Queue para falhas persistentes
+- Filtros de eventos disponíveis
+
+### Backup e Recuperação
+
+**P: Qual a diferença entre PITR e On-Demand Backup?**
+R: 
+**PITR (Point-in-Time Recovery)**:
+- Contínuo, últimos 35 dias
+- Restore para qualquer segundo
+- Custo: storage dos dados
+- Recovery em nova tabela
+
+**On-Demand Backup**:
+- Manual ou agendado
+- Retenção ilimitada
+- Restore exato do momento
+- Útil para compliance
+
+**P: Backups afetam performance?**
+R: Não! Tanto PITR quanto on-demand backups não consomem throughput provisionado e não impactam latência de requests.
+
+### Segurança
+
+**P: Como implementar multi-tenancy seguro?**
+R: Estratégias:
+1. **Tabela por tenant**: Isolamento máximo, gestão complexa
+2. **Partition key = tenantId**: Eficiente, usar IAM condition keys
+3. **Tenant ID como prefixo**: Flexível, requer validação na app
+4. **Fine-grained access control**: IAM policy com condições
+
+**P: Como usar IAM para acesso granular?**
+R: Use IAM conditions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "dynamodb:GetItem",
+      "dynamodb:Query"
+    ],
+    "Resource": "arn:aws:dynamodb:region:account:table/Users",
+    "Condition": {
+      "ForAllValues:StringEquals": {
+        "dynamodb:LeadingKeys": ["${aws:userid}"]
+      }
+    }
+  }]
+}
+```
+
+Usuário só acessa items onde partition key = seu user ID.
+
+## Exemplos Avançados
+
+### Exemplo 1: E-commerce Order System com Single Table Design
+
+```python
+import boto3
+from datetime import datetime
+from decimal import Decimal
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('EcommerceApp')
+
+class OrderService:
+    def create_order(self, user_id, items):
+        """Cria pedido com transaction para garantir atomicidade"""
+        order_id = f"ORDER#{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        timestamp = datetime.now().isoformat()
+        
+        # Calcular total
+        total = sum(item['price'] * item['quantity'] for item in items)
+        
+        # Transaction items
+        transact_items = []
+        
+        # 1. Criar order
+        transact_items.append({
+            'Put': {
+                'TableName': 'EcommerceApp',
+                'Item': {
+                    'PK': {'S': f'USER#{user_id}'},
+                    'SK': {'S': order_id},
+                    'EntityType': {'S': 'ORDER'},
+                    'OrderId': {'S': order_id},
+                    'Status': {'S': 'PENDING'},
+                    'Total': {'N': str(total)},
+                    'Items': {'L': [
+                        {'M': {
+                            'ProductId': {'S': item['product_id']},
+                            'Quantity': {'N': str(item['quantity'])},
+                            'Price': {'N': str(item['price'])}
+                        }} for item in items
+                    ]},
+                    'CreatedAt': {'S': timestamp}
+                }
+            }
+        })
+        
+        # 2. Decrementar inventory para cada item
+        for item in items:
+            transact_items.append({
+                'Update': {
+                    'TableName': 'EcommerceApp',
+                    'Key': {
+                        'PK': {'S': f"PRODUCT#{item['product_id']}"},
+                        'SK': {'S': 'INVENTORY'}
+                    },
+                    'UpdateExpression': 'SET Stock = Stock - :qty',
+                    'ConditionExpression': 'Stock >= :qty',
+                    'ExpressionAttributeValues': {
+                        ':qty': {'N': str(item['quantity'])}
+                    }
+                }
+            })
+        
+        # 3. Criar index entry por status para queries
+        transact_items.append({
+            'Put': {
+                'TableName': 'EcommerceApp',
+                'Item': {
+                    'PK': {'S': 'STATUS#PENDING'},
+                    'SK': {'S': f"{timestamp}#{order_id}"},
+                    'EntityType': {'S': 'ORDER_INDEX'},
+                    'UserId': {'S': user_id},
+                    'OrderId': {'S': order_id},
+                    'Total': {'N': str(total)}
+                }
+            }
+        })
+        
+        # Executar transaction
+        client = boto3.client('dynamodb')
+        try:
+            client.transact_write_items(TransactItems=transact_items)
+            return {'success': True, 'order_id': order_id}
+        except Exception as e:
+            if 'TransactionCanceledException' in str(e):
+                return {'success': False, 'error': 'Stock insuficiente ou outro erro'}
+            raise
+    
+    def get_user_orders(self, user_id):
+        """Busca todos os pedidos de um usuário"""
+        response = table.query(
+            KeyConditionExpression='PK = :pk AND begins_with(SK, :sk)',
+            ExpressionAttributeValues={
+                ':pk': f'USER#{user_id}',
+                ':sk': 'ORDER#'
+            }
+        )
+        return response['Items']
+    
+    def get_orders_by_status(self, status):
+        """Busca pedidos por status (usa GSI ou secondary index)"""
+        response = table.query(
+            KeyConditionExpression='PK = :pk',
+            ExpressionAttributeValues={
+                ':pk': f'STATUS#{status}'
+            },
+            ScanIndexForward=False,  # Mais recentes primeiro
+            Limit=50
+        )
+        return response['Items']
+    
+    def update_order_status(self, user_id, order_id, new_status):
+        """Atualiza status do pedido"""
+        old_status_needed = True
+        
+        # Primeiro, get para saber o status antigo
+        response = table.get_item(
+            Key={
+                'PK': f'USER#{user_id}',
+                'SK': order_id
+            }
+        )
+        
+        if 'Item' not in response:
+            return {'success': False, 'error': 'Order not found'}
+        
+        old_status = response['Item']['Status']
+        timestamp = response['Item']['CreatedAt']
+        
+        # Transaction para update status em múltiplos places
+        client = boto3.client('dynamodb')
+        client.transact_write_items(
+            TransactItems=[
+                # Update main order record
+                {
+                    'Update': {
+                        'TableName': 'EcommerceApp',
+                        'Key': {
+                            'PK': {'S': f'USER#{user_id}'},
+                            'SK': {'S': order_id}
+                        },
+                        'UpdateExpression': 'SET #status = :new_status, UpdatedAt = :now',
+                        'ExpressionAttributeNames': {'#status': 'Status'},
+                        'ExpressionAttributeValues': {
+                            ':new_status': {'S': new_status},
+                            ':now': {'S': datetime.now().isoformat()}
+                        }
+                    }
+                },
+                # Delete old status index
+                {
+                    'Delete': {
+                        'TableName': 'EcommerceApp',
+                        'Key': {
+                            'PK': {'S': f'STATUS#{old_status}'},
+                            'SK': {'S': f"{timestamp}#{order_id}"}
+                        }
+                    }
+                },
+                # Create new status index
+                {
+                    'Put': {
+                        'TableName': 'EcommerceApp',
+                        'Item': {
+                            'PK': {'S': f'STATUS#{new_status}'},
+                            'SK': {'S': f"{timestamp}#{order_id}"},
+                            'EntityType': {'S': 'ORDER_INDEX'},
+                            'UserId': {'S': user_id},
+                            'OrderId': {'S': order_id}
+                        }
+                    }
+                }
+            ]
+        )
+        
+        return {'success': True}
+
+# Uso
+service = OrderService()
+
+# Criar pedido
+result = service.create_order(
+    user_id='USER123',
+    items=[
+        {'product_id': 'PROD001', 'quantity': 2, 'price': Decimal('29.99')},
+        {'product_id': 'PROD002', 'quantity': 1, 'price': Decimal('49.99')}
+    ]
+)
+
+# Buscar pedidos do usuário
+orders = service.get_user_orders('USER123')
+
+# Buscar pedidos pendentes
+pending = service.get_orders_by_status('PENDING')
+
+# Atualizar status
+service.update_order_status('USER123', 'ORDER#20241204120000', 'SHIPPED')
+```
+
+### Exemplo 2: Time-Series Data com TTL
+
+```python
+import boto3
+from datetime import datetime, timedelta
+import time
+
+class IoTDataService:
+    def __init__(self):
+        self.dynamodb = boto3.resource('dynamodb')
+        self.table = self.dynamodb.Table('IoTMetrics')
+    
+    def setup_table(self):
+        """Criar tabela com TTL habilitado"""
+        client = boto3.client('dynamodb')
+        
+        # Criar tabela
+        client.create_table(
+            TableName='IoTMetrics',
+            KeySchema=[
+                {'AttributeName': 'DeviceId', 'KeyType': 'HASH'},
+                {'AttributeName': 'Timestamp', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'DeviceId', 'AttributeType': 'S'},
+                {'AttributeName': 'Timestamp', 'AttributeType': 'N'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+        
+        # Aguardar tabela estar ativa
+        waiter = client.get_waiter('table_exists')
+        waiter.wait(TableName='IoTMetrics')
+        
+        # Habilitar TTL
+        client.update_time_to_live(
+            TableName='IoTMetrics',
+            TimeToLiveSpecification={
+                'Enabled': True,
+                'AttributeName': 'ExpiresAt'
+            }
+        )
+        
+        print("Tabela criada com TTL habilitado")
+    
+    def record_metric(self, device_id, metric_type, value, retention_days=7):
+        """Registra métrica com TTL automático"""
+        timestamp = int(time.time())
+        expires_at = timestamp + (retention_days * 86400)
+        
+        self.table.put_item(
+            Item={
+                'DeviceId': device_id,
+                'Timestamp': timestamp,
+                'MetricType': metric_type,
+                'Value': value,
+                'RecordedAt': datetime.now().isoformat(),
+                'ExpiresAt': expires_at  # TTL attribute
+            }
+        )
+    
+    def batch_record_metrics(self, metrics):
+        """Registro em batch para eficiência"""
+        with self.table.batch_writer() as batch:
+            for metric in metrics:
+                timestamp = int(time.time())
+                expires_at = timestamp + (metric.get('retention_days', 7) * 86400)
+                
+                batch.put_item(Item={
+                    'DeviceId': metric['device_id'],
+                    'Timestamp': timestamp,
+                    'MetricType': metric['type'],
+                    'Value': metric['value'],
+                    'RecordedAt': datetime.now().isoformat(),
+                    'ExpiresAt': expires_at
+                })
+    
+    def query_device_metrics(self, device_id, hours_back=24):
+        """Query métricas recentes de um device"""
+        start_time = int(time.time()) - (hours_back * 3600)
+        
+        response = self.table.query(
+            KeyConditionExpression='DeviceId = :device AND #ts >= :start',
+            ExpressionAttributeNames={'#ts': 'Timestamp'},
+            ExpressionAttributeValues={
+                ':device': device_id,
+                ':start': start_time
+            },
+            ScanIndexForward=False  # Mais recentes primeiro
+        )
+        
+        return response['Items']
+    
+    def get_latest_metric(self, device_id):
+        """Pega métrica mais recente"""
+        response = self.table.query(
+            KeyConditionExpression='DeviceId = :device',
+            ExpressionAttributeValues={':device': device_id},
+            ScanIndexForward=False,
+            Limit=1
+        )
+        
+        if response['Items']:
+            return response['Items'][0]
+        return None
+    
+    def aggregate_metrics(self, device_id, hours_back=1):
+        """Agrega métricas (exemplo: média)"""
+        metrics = self.query_device_metrics(device_id, hours_back)
+        
+        if not metrics:
+            return None
+        
+        # Calcular agregações
+        values = [m['Value'] for m in metrics]
+        return {
+            'device_id': device_id,
+            'count': len(values),
+            'avg': sum(values) / len(values),
+            'min': min(values),
+            'max': max(values),
+            'period': f'{hours_back}h'
+        }
+
+# Uso
+service = IoTDataService()
+
+# Registrar métricas individuais
+service.record_metric('DEVICE001', 'temperature', 23.5, retention_days=30)
+service.record_metric('DEVICE001', 'humidity', 65.2, retention_days=30)
+
+# Registro em batch (mais eficiente)
+metrics = [
+    {'device_id': 'DEVICE001', 'type': 'temperature', 'value': 24.1, 'retention_days': 7},
+    {'device_id': 'DEVICE001', 'type': 'humidity', 'value': 64.8, 'retention_days': 7},
+    {'device_id': 'DEVICE002', 'type': 'temperature', 'value': 22.3, 'retention_days': 7}
+]
+service.batch_record_metrics(metrics)
+
+# Query métricas
+recent = service.query_device_metrics('DEVICE001', hours_back=24)
+latest = service.get_latest_metric('DEVICE001')
+aggregated = service.aggregate_metrics('DEVICE001', hours_back=1)
+
+print(f"Agregação: {aggregated}")
+```
+
+### Exemplo 3: Caching com DAX
+
+```python
+import boto3
+from amazondax import AmazonDaxClient
+
+class CachedDataService:
+    def __init__(self, use_dax=True):
+        if use_dax:
+            # Conectar ao DAX cluster
+            self.client = AmazonDaxClient(endpoint_url='dax://my-cluster.abc123.dax-clusters.us-east-1.amazonaws.com')
+        else:
+            # Fallback para DynamoDB direto
+            self.client = boto3.client('dynamodb')
+        
+        self.table_name = 'Products'
+    
+    def get_product(self, product_id):
+        """
+        Get com DAX - primeira chamada vai para DynamoDB,
+        chamadas subsequentes vêm do cache DAX (microsegundos)
+        """
+        response = self.client.get_item(
+            TableName=self.table_name,
+            Key={'ProductId': {'S': product_id}}
+        )
+        return response.get('Item')
+    
+    def get_products_batch(self, product_ids):
+        """Batch get com DAX"""
+        keys = [{'ProductId': {'S': pid}} for pid in product_ids]
+        
+        response = self.client.batch_get_item(
+            RequestItems={
+                self.table_name: {
+                    'Keys': keys
+                }
+            }
+        )
+        
+        return response['Responses'].get(self.table_name, [])
+    
+    def query_category(self, category):
+        """
+        Query com DAX - resultados são cached
+        Ideal para queries frequentemente repetidas
+        """
+        response = self.client.query(
+            TableName=self.table_name,
+            IndexName='CategoryIndex',
+            KeyConditionExpression='Category = :cat',
+            ExpressionAttributeValues={
+                ':cat': {'S': category}
+            }
+        )
+        
+        return response.get('Items', [])
+    
+    def update_product(self, product_id, updates):
+        """
+        Writes invalidam cache automaticamente no DAX
+        """
+        update_expression = 'SET ' + ', '.join([f'{k} = :{k}' for k in updates.keys()])
+        expression_values = {f':{k}': {'S': str(v)} for k, v in updates.items()}
+        
+        self.client.update_item(
+            TableName=self.table_name,
+            Key={'ProductId': {'S': product_id}},
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_values
+        )
+
+# Comparação de performance
+import time
+
+def benchmark_with_without_dax():
+    # Sem DAX
+    service_no_dax = CachedDataService(use_dax=False)
+    start = time.time()
+    for _ in range(100):
+        service_no_dax.get_product('PROD001')
+    no_dax_time = time.time() - start
+    
+    # Com DAX (após cache warming)
+    service_dax = CachedDataService(use_dax=True)
+    service_dax.get_product('PROD001')  # Warm up cache
+    start = time.time()
+    for _ in range(100):
+        service_dax.get_product('PROD001')
+    dax_time = time.time() - start
+    
+    print(f"Sem DAX: {no_dax_time:.3f}s")
+    print(f"Com DAX: {dax_time:.3f}s")
+    print(f"Speedup: {no_dax_time/dax_time:.1f}x")
+```
+
 ## Recursos de Aprendizado
 
 - [DynamoDB Developer Guide](https://docs.aws.amazon.com/dynamodb/)
 - [DynamoDB Best Practices](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html)
-- [The DynamoDB Book](https://www.dynamodbbook.com/)
+- [The DynamoDB Book](https://www.dynamodbbook.com/) by Alex DeBrie
 - [AWS re:Invent DynamoDB Sessions](https://www.youtube.com/results?search_query=reinvent+dynamodb)
+- [DynamoDB Guide](https://www.dynamodbguide.com/)
+- [AWS Workshops - DynamoDB](https://workshops.aws/categories/DynamoDB)
+- [DynamoDB Toolbox](https://github.com/jeremydaly/dynamodb-toolbox) - Library to simplify operations

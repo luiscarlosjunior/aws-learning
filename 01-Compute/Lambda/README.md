@@ -255,6 +255,195 @@ aws lambda list-functions
 aws logs tail /aws/lambda/my-function --follow
 ```
 
+## Troubleshooting Comum
+
+### Cold Start Lento
+**Problema**: Primeira invocação muito lenta
+**Soluções**:
+- Use Provisioned Concurrency para manter funções warm
+- Minimize deployment package size
+- Remova dependências desnecessárias
+- Use Lambda Layers para dependências pesadas
+- Considere linguagens com startup mais rápido (Python, Node.js vs Java, .NET)
+- Mantenha código fora do handler quando possível
+
+### Timeout Errors
+**Problema**: Função excede tempo limite
+**Soluções**:
+- Aumentar timeout (máximo 15 minutos)
+- Otimizar código
+- Fazer operações assíncronas quando possível
+- Quebrar função grande em múltiplas funções menores
+- Usar Step Functions para workflows longos
+- Verificar se não há wait desnecessário
+
+### Out of Memory Errors
+**Problema**: Função fica sem memória
+**Soluções**:
+- Aumentar memória alocada
+- Otimizar uso de memória no código
+- Processar dados em chunks ao invés de tudo de uma vez
+- Liberar recursos explicitamente
+- Usar /tmp com cuidado (limite de 10 GB)
+- Considerar streaming para grandes arquivos
+
+### Throttling Errors
+**Problema**: TooManyRequestsException
+**Soluções**:
+- Aumentar reserved concurrency
+- Solicitar aumento de concurrent execution limit
+- Implementar retry com exponential backoff
+- Usar SQS como buffer
+- Distribuir carga ao longo do tempo
+- Verificar se não há recursive invocation acidental
+
+### VPC Timeout Issues
+**Problema**: Lambda em VPC não consegue acessar recursos
+**Soluções**:
+- Verificar security groups e NACLs
+- Adicionar NAT Gateway para acesso à internet
+- Usar VPC endpoints para serviços AWS
+- Verificar route tables
+- Ensure ENI capacity na subnet
+- Considere usar Hyperplane ENIs (automático em funções novas)
+
+## Perguntas e Respostas (Q&A)
+
+### Conceitos Fundamentais
+
+**P: Quando devo usar Lambda vs EC2 vs Fargate?**
+R:
+- **Lambda**: Event-driven, curta duração (<15 min), stateless, pagamento por execução
+- **EC2**: Controle total, long-running, stateful, aplicações legacy
+- **Fargate**: Containers, longa duração, melhor para microservices consistentes
+
+Use Lambda quando:
+- Workload é event-driven e intermitente
+- Execução < 15 minutos
+- Quer zero gerenciamento de infraestrutura
+- Custo é proporcional ao uso real
+
+**P: Lambda é realmente serverless?**
+R: Sim, no sentido que você não gerencia servidores. Mas há servidores executando seu código - você apenas não os vê ou gerencia. AWS cuida de provisioning, patching, scaling, alta disponibilidade.
+
+**P: Como Lambda escalona?**
+R: Automaticamente e instantaneamente. Cada invocação pode executar em parallel. Limite padrão: 1000 concurrent executions por região (pode ser aumentado). Se exceder, novas invocações são throttled.
+
+**P: O que acontece quando Lambda atinge o limite de concorrência?**
+R: Invocações são throttled (TooManyRequestsException). Para invocações síncronas, cliente recebe erro 429. Para invocações assíncronas, Lambda retenta automaticamente e depois envia para DLQ se configurado.
+
+### Cold Start vs Warm Start
+
+**P: O que causa cold start?**
+R: Cold start ocorre quando:
+- Primeira invocação da função
+- Função não foi invocada por ~15 minutos
+- Código ou configuração mudou
+- Concorrência aumenta (novos execution environments)
+
+**P: Quanto tempo dura um cold start?**
+R: Depende da linguagem e tamanho:
+- Python/Node.js: 100-300ms
+- Java/.NET: 500-1000ms (ou mais)
+- Go: 200-400ms
+- Com VPC: Adicione 1-2 segundos (mas melhorou muito com Hyperplane ENIs)
+
+**P: Como minimizar impacto de cold starts?**
+R:
+1. Use Provisioned Concurrency (custo extra)
+2. Mantenha deployment package pequeno
+3. Minimize dependências
+4. Use Lambda SnapStart (Java 11+)
+5. Escolha linguagens com startup rápido
+6. Implemente lazy loading
+7. Reutilize conexões (databases, HTTP clients) fora do handler
+8. Use CloudWatch Events para "warm" função periodicamente (último recurso)
+
+**P: Provisioned Concurrency vale a pena?**
+R: Depende:
+- **Sim** se: Latência previsível é crítica, custo de cold starts é alto, tráfego consistente
+- **Não** se: Tráfego muito variável, cold starts toleráveis, custo é limitante
+- Custo: ~$0.015/GB-hour (além do custo normal de execução)
+
+### Performance e Otimização
+
+**P: Mais memória = melhor performance?**
+R: Sim! Memória e CPU são proporcionais. Dobrar memória dobra CPU. Muitas vezes, mais memória = execução mais rápida = custo total menor. Use AWS Lambda Power Tuning para encontrar sweet spot.
+
+**P: Como otimizar tamanho do deployment package?**
+R:
+1. Remova dependências não utilizadas
+2. Use Lambda Layers para código compartilhado
+3. Minimize devDependencies (Node.js)
+4. Use tree shaking e minification
+5. Exclua arquivos desnecessários (.git, tests, docs)
+6. Considere usar Lambda Container Images (até 10 GB)
+
+**P: Devo usar /tmp directory?**
+R: Sim, mas com cuidado:
+- Até 10 GB disponível (configurável desde 512 MB)
+- Persiste durante warm starts
+- Não compartilhado entre executions
+- Use para cache temporário, downloads
+- Limpe arquivos grandes para liberar espaço
+
+**P: Como reutilizar conexões de database?**
+R: Declare conexão fora do handler. Ou use RDS Proxy para pooling gerenciado.
+
+### Custos
+
+**P: Como é calculado o custo do Lambda?**
+R: Dois componentes:
+1. **Requests**: $0.20 por 1M requests (primeiro 1M grátis/mês)
+2. **Duration**: $0.0000166667 por GB-second (400.000 GB-s grátis/mês)
+
+Exemplo:
+- 1M invocações, 512 MB, 200ms média
+- Requests: $0.20
+- Duration: 1M × 0.5 GB × 0.2s × $0.0000166667 = $1.67
+- **Total: $1.87/mês**
+
+**P: Como reduzir custos do Lambda?**
+R:
+1. Otimize duração (código mais rápido)
+2. Use memória adequada
+3. Evite polling desnecessário
+4. Use batching quando possível
+5. Compute Savings Plans (até 17% desconto)
+6. Delete funções não utilizadas
+
+**P: Lambda é sempre mais barato que EC2?**
+R: Não! Depende do uso:
+- **Lambda mais barato**: Tráfego intermitente, baixo volume
+- **EC2 mais barato**: Alto volume constante (>40% utilização 24/7)
+- **Breakeven**: ~40-50% utilização constante
+
+### Segurança
+
+**P: Como Lambda acessa outros serviços AWS?**
+R: Via IAM Execution Role. Role define quais serviços Lambda pode acessar e quais ações pode realizar. Nunca hardcode credentials!
+
+**P: Como proteger secrets em Lambda?**
+R:
+1. **AWS Secrets Manager**: Melhor para rotation automática
+2. **Systems Manager Parameter Store**: Grátis para parâmetros standard
+3. **Environment Variables**: Apenas encrypted
+4. **KMS**: Para encryption adicional
+
+**P: Lambda em VPC é seguro?**
+R: Não necessariamente mais seguro, mas oferece acesso a recursos privados (RDS, ElastiCache), network isolation, e security groups para controle de tráfego. Trade-off: Adiciona complexidade.
+
+### Integração e Padrões
+
+**P: Como orquestrar múltiplas Lambdas?**
+R: Use **AWS Step Functions** para visual workflow, error handling, retry, parallel execution, e state management. Alternativa: EventBridge para event-driven choreography.
+
+**P: Como processar arquivos grandes (>GB) com Lambda?**
+R: Use S3 Select, streaming em chunks, split de arquivos, Lambda chain, ou considere ECS/Fargate para processamento muito grande.
+
+**P: Como implementar API REST com Lambda?**
+R: API Gateway + Lambda (mais comum), Lambda Function URLs (simples), ou ALB + Lambda (integração com ALB existente).
+
 ## Recursos de Aprendizado
 
 - [Lambda Developer Guide](https://docs.aws.amazon.com/lambda/)
@@ -262,3 +451,7 @@ aws logs tail /aws/lambda/my-function --follow
 - [AWS Lambda Power Tuning](https://github.com/alexcasalboni/aws-lambda-power-tuning)
 - [Serverless Framework](https://www.serverless.com/)
 - [AWS Serverless Workshops](https://workshops.aws/)
+- [AWS Lambda Powertools](https://awslabs.github.io/aws-lambda-powertools-python/)
+- [Serverless Land](https://serverlessland.com/)
+- [AWS re:Invent Lambda Sessions](https://www.youtube.com/results?search_query=reinvent+lambda)
+- [Lambda Best Practices](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html)
