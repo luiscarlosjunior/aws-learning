@@ -433,8 +433,8 @@ Resources:
             <html>
             <head><title>EC2 Auto Scaling Demo</title></head>
             <body>
-              <h1>Instance: $(ec2-metadata --instance-id | cut -d " " -f 2)</h1>
-              <h2>Availability Zone: $(ec2-metadata --availability-zone | cut -d " " -f 2)</h2>
+              <h1>Instance: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</h1>
+              <h2>Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</h2>
             </body>
             </html>
             EOF

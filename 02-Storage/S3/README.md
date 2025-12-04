@@ -536,36 +536,43 @@ s3 = boto3.client('s3')
 def lambda_handler(event, context):
     """Cria thumbnail quando imagem é uploaded"""
     
-    # Pegar informações do evento S3
-    bucket = event['Records'][0]['s3']['bucket']['name']
-    key = event['Records'][0]['s3']['object']['key']
-    
-    # Baixar imagem original
-    response = s3.get_object(Bucket=bucket, Key=key)
-    image_content = response['Body'].read()
-    
-    # Criar thumbnail
-    image = Image.open(io.BytesIO(image_content))
-    image.thumbnail((200, 200))
-    
-    # Salvar thumbnail
-    buffer = io.BytesIO()
-    image.save(buffer, format='JPEG')
-    buffer.seek(0)
-    
-    # Upload thumbnail
-    thumbnail_key = f"thumbnails/{key}"
-    s3.put_object(
-        Bucket=bucket,
-        Key=thumbnail_key,
-        Body=buffer,
-        ContentType='image/jpeg'
-    )
-    
-    return {
-        'statusCode': 200,
-        'body': f'Thumbnail criado: {thumbnail_key}'
-    }
+    try:
+        # Pegar informações do evento S3
+        if 'Records' not in event or not event['Records']:
+            raise ValueError("Invalid S3 event: no records found")
+        
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+        
+        # Baixar imagem original
+        response = s3.get_object(Bucket=bucket, Key=key)
+        image_content = response['Body'].read()
+        
+        # Criar thumbnail
+        image = Image.open(io.BytesIO(image_content))
+        image.thumbnail((200, 200))
+        
+        # Salvar thumbnail
+        buffer = io.BytesIO()
+        image.save(buffer, format='JPEG')
+        buffer.seek(0)
+        
+        # Upload thumbnail
+        thumbnail_key = f"thumbnails/{key}"
+        s3.put_object(
+            Bucket=bucket,
+            Key=thumbnail_key,
+            Body=buffer,
+            ContentType='image/jpeg'
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': f'Thumbnail criado: {thumbnail_key}'
+        }
+    except Exception as e:
+        print(f"Error processing S3 event: {str(e)}")
+        raise
 ```
 
 ### Exemplo 2: CloudFormation para Bucket Seguro

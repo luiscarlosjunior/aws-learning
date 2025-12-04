@@ -1219,8 +1219,8 @@ def benchmark_with_without_dax():
 
 - [DynamoDB Developer Guide](https://docs.aws.amazon.com/dynamodb/)
 - [DynamoDB Best Practices](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html)
-- [The DynamoDB Book](https://www.dynamodbbook.com/) por Alex DeBrie
+- [The DynamoDB Book](https://www.dynamodbbook.com/) by Alex DeBrie
 - [AWS re:Invent DynamoDB Sessions](https://www.youtube.com/results?search_query=reinvent+dynamodb)
 - [DynamoDB Guide](https://www.dynamodbguide.com/)
 - [AWS Workshops - DynamoDB](https://workshops.aws/categories/DynamoDB)
-- [DynamoDB Toolbox](https://github.com/jeremydaly/dynamodb-toolbox) - Library para simplificar operações
+- [DynamoDB Toolbox](https://github.com/jeremydaly/dynamodb-toolbox) - Library to simplify operations
