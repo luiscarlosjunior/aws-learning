@@ -1821,13 +1821,17 @@ ORDER BY revenue DESC;
 **Contexto**: Identificar períodos sem dados.
 
 ```sql
+-- ⚠️ NOTA: Athena/Presto NÃO suporta RECURSIVE CTEs
+-- Use SEQUENCE para gerar série de datas
+
 -- Gerar série de datas completa e identificar gaps
-WITH RECURSIVE date_series AS (
-    SELECT DATE '2024-01-01' AS date
-    UNION ALL
-    SELECT date + INTERVAL '1' DAY
-    FROM date_series
-    WHERE date < DATE '2024-12-31'
+WITH date_array AS (
+    SELECT SEQUENCE(DATE '2024-01-01', DATE '2024-12-31', INTERVAL '1' DAY) AS dates
+),
+date_series AS (
+    SELECT date_value AS date
+    FROM date_array
+    CROSS JOIN UNNEST(dates) AS t(date_value)
 ),
 actual_data AS (
     SELECT 
@@ -1847,31 +1851,6 @@ SELECT
 FROM date_series ds
 LEFT JOIN actual_data ad ON ds.date = ad.date
 WHERE ad.order_count IS NULL  -- Apenas dias sem dados
-ORDER BY ds.date;
-
--- Alternativa sem recursão (para Athena/Presto)
-WITH date_array AS (
-    SELECT SEQUENCE(DATE '2024-01-01', DATE '2024-12-31', INTERVAL '1' DAY) AS dates
-),
-date_series AS (
-    SELECT date_value AS date
-    FROM date_array
-    CROSS JOIN UNNEST(dates) AS t(date_value)
-),
-actual_data AS (
-    SELECT 
-        DATE(order_date) AS date,
-        COUNT(*) AS order_count
-    FROM orders
-    WHERE order_date >= DATE '2024-01-01'
-    GROUP BY DATE(order_date)
-)
-SELECT 
-    ds.date,
-    COALESCE(ad.order_count, 0) AS order_count
-FROM date_series ds
-LEFT JOIN actual_data ad ON ds.date = ad.date
-WHERE ad.order_count IS NULL
 ORDER BY ds.date;
 ```
 
@@ -1933,12 +1912,16 @@ FROM events_csv;
 ### 3. Incremental Processing
 
 ```sql
--- Pattern para processar apenas dados novos
-CREATE TABLE processed_events AS
-SELECT * FROM raw_events WHERE 1=0;  -- Schema only
+-- ⚠️ NOTA: Athena não suporta INSERT INTO para tabelas externas
+-- Use CTAS (Create Table As Select) para processar dados incrementais
 
 -- Primeira execução: processar tudo
-INSERT INTO processed_events
+CREATE TABLE processed_events
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://bucket/processed-events/'
+)
+AS
 SELECT 
     event_id,
     user_id,
@@ -1947,8 +1930,15 @@ SELECT
     CURRENT_TIMESTAMP AS processed_at
 FROM raw_events;
 
--- Execuções subsequentes: apenas novos dados
-INSERT INTO processed_events
+-- Execuções subsequentes: recrie com dados novos + antigos
+CREATE TABLE processed_events_new
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://bucket/processed-events-new/'
+)
+AS
+SELECT * FROM processed_events
+UNION ALL
 SELECT 
     re.event_id,
     re.user_id,
@@ -1958,6 +1948,10 @@ SELECT
 FROM raw_events re
 LEFT JOIN processed_events pe ON re.event_id = pe.event_id
 WHERE pe.event_id IS NULL;
+
+-- Substituir tabela antiga
+DROP TABLE processed_events;
+ALTER TABLE processed_events_new RENAME TO processed_events;
 ```
 
 ### 4. Query Result Reuse
@@ -1970,7 +1964,12 @@ WHERE pe.event_id IS NULL;
 SELECT COUNT(*) FROM orders WHERE status = 'completed';
 
 -- 2. Configure workgroup para enable query result reuse
--- aws athena update-work-group --work-group primary --configuration-updates ResultConfigurationUpdates={OutputLocation=s3://bucket/},EnforceWorkGroupConfiguration=true,QueryResultsReuseConfiguration={Enable=true}
+-- aws athena update-work-group \
+--   --work-group primary \
+--   --configuration-updates \
+--     ResultConfigurationUpdates={OutputLocation=s3://bucket/},\
+--     EnforceWorkGroupConfiguration=true,\
+--     QueryResultsReuseConfiguration={Enable=true}
 
 -- 3. Verifique se query usou cache
 -- aws athena get-query-execution --query-execution-id <id>
