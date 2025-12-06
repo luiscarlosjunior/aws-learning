@@ -614,7 +614,7 @@ SELECT * FROM orders
 ORDER BY total_amount DESC 
 LIMIT 10;
 
--- Paginação (com OFFSET no Presto)
+-- Paginação com OFFSET
 SELECT * FROM users 
 ORDER BY created_at DESC 
 OFFSET 100 LIMIT 50;
@@ -1384,9 +1384,9 @@ rfm_scores AS (
         recency,
         frequency,
         monetary,
-        NTILE(5) OVER (ORDER BY recency DESC) AS r_score,
-        NTILE(5) OVER (ORDER BY frequency ASC) AS f_score,
-        NTILE(5) OVER (ORDER BY monetary ASC) AS m_score
+        NTILE(5) OVER (ORDER BY recency ASC) AS r_score,  -- Menor recency = melhor
+        NTILE(5) OVER (ORDER BY frequency DESC) AS f_score,  -- Maior frequency = melhor
+        NTILE(5) OVER (ORDER BY monetary DESC) AS m_score  -- Maior monetary = melhor
     FROM customer_rfm
 )
 SELECT 
@@ -1512,7 +1512,7 @@ FROM logs;
 WITH valid_logs AS (
     SELECT *
     FROM logs
-    WHERE TRY(json_parse(log_data)) IS NOT NULL
+    WHERE TRY(json_parse(log_data)) IS NOT NULL  -- Verifica se é JSON válido
 )
 SELECT 
     json_extract_scalar(log_data, '$.user_id') AS user_id,
@@ -1653,6 +1653,7 @@ DELETE FROM users WHERE status = 'inactive';
 UPDATE users SET status = 'active' WHERE user_id = 123;
 
 -- ✅ SOLUÇÃO: Recriar tabela sem os registros
+-- Passo 1: Criar nova tabela com dados filtrados
 CREATE TABLE users_new
 WITH (
     format = 'PARQUET',
@@ -1663,7 +1664,13 @@ SELECT *
 FROM users
 WHERE status != 'inactive';  -- Excluir registros
 
--- Depois renomear/substituir
+-- Passo 2: Verificar nova tabela
+SELECT COUNT(*) FROM users_new;
+
+-- Passo 3: Backup da tabela original (opcional)
+CREATE TABLE users_backup AS SELECT * FROM users;
+
+-- Passo 4: Remover tabela antiga e renomear
 DROP TABLE users;
 ALTER TABLE users_new RENAME TO users;
 
