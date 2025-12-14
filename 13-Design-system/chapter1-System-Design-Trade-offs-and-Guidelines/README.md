@@ -146,7 +146,7 @@ Confiabilidade é a capacidade de um sistema executar suas funções pretendidas
 **Recuperação de Desastres (DR):**
 - **RPO (Recovery Point Objective)**: Máxima quantidade de dados que pode ser perdida
 - **RTO (Recovery Time Objective)**: Tempo máximo para recuperação
-- Estratégias: Backup and Restore, Pilot Light, Warm Standby, Multi-Site Active-Active
+- Estratégias: Backup e Restauração (Backup and Restore), Pilot Light, Standby Quente (Warm Standby), Multi-Site Ativo-Ativo (Multi-Site Active-Active)
 
 ### Princípios de Confiabilidade na AWS
 
@@ -298,9 +298,9 @@ Tolerância a falhas é a capacidade de um sistema continuar operando corretamen
 
 **Design for Failure:**
 - Assumir que tudo pode falhar (servidores, rede, discos, etc.)
-- "Everything fails all the time" - Werner Vogels (CTO da Amazon)
-- Projetar sistemas que degradem gracefully
-- Implementar fallback mechanisms
+- "Everything fails all the time" ("Tudo falha o tempo todo") - Werner Vogels (CTO da Amazon)
+- Projetar sistemas que degradem graciosamente
+- Implementar mecanismos de fallback
 
 **Isolamento de Falhas:**
 - **Bulkhead Pattern**: Isolar recursos para evitar cascata de falhas
