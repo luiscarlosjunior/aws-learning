@@ -91,6 +91,9 @@ Provisionamento e gerenciamento de certificados SSL/TLS.
 - Importação de certificados terceiros
 - Wildcard certificates
 
+**Ver também:**
+- [Algoritmos de Criptografia](./Cryptographic-Algorithms/README.md) - Guia detalhado sobre RSA, ECC, PBES#1, PBES#2 e compatibilidade com serviços AWS
+
 ### WAF (Web Application Firewall)
 Proteção de aplicações web contra exploits comuns.
 
