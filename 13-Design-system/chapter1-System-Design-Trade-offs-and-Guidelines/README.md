@@ -380,7 +380,7 @@ Tolerância a falhas é a capacidade de um sistema continuar operando corretamen
 
 ## 8. Falácias de Sistemas Distribuídos
 
-As Falácias de Computação Distribuída (Fallacies of Distributed Computing) foram formuladas por L. Peter Deutsch e outros engenheiros da Sun Microsystems na década de 1990. Estas falácias representam suposições errôneas que desenvolvedores frequentemente fazem ao projetar sistemas distribuídos, levando a falhas de design e problemas em produção. Como afirma Deutsch, "essencialmente todas as aplicações distribuídas falham em considerar pelo menos uma dessas falácias" (Deutsch, 1994).
+As Falácias de Computação Distribuída (Fallacies of Distributed Computing) foram formuladas por L. Peter Deutsch e outros engenheiros da Sun Microsystems na década de 1990, mas permanecem extremamente relevantes na era da cloud computing. Estas falácias representam suposições errôneas que desenvolvedores frequentemente fazem ao projetar sistemas distribuídos, levando a falhas de design e problemas em produção. Como afirma Deutsch, "essencialmente todas as aplicações distribuídas falham em considerar pelo menos uma dessas falácias" (Deutsch, 1994).
 
 ### As 8 Falácias Essenciais
 
@@ -646,7 +646,7 @@ Projetar com essas falácias em mente desde o início evita retrabalho caro e pr
 
 ## Resumo
 
-Os conceitos fundamentais de System Design são interconectados e frequentemente envolvem trade-offs:
+Os oito conceitos fundamentais de System Design são interconectados e frequentemente envolvem trade-offs:
 
 1. **Comunicação**: Base para sistemas distribuídos - escolha entre síncrono/assíncrono
 2. **Consistência**: Garantia de dados corretos - trade-off com disponibilidade (CAP)
