@@ -60,7 +60,7 @@ n = p × q = 61 × 53 = 3233
 **Passo 4: Escolher expoente público e**
 ```
 e = 17 (deve ser coprimo com φ(n) e 1 < e < φ(n))
-Geralmente usa-se e = 65537 (2^16 + 1) na prática
+Geralmente, utiliza-se e = 65537 (2¹⁶ + 1), que é o expoente público padrão em implementações RSA.
 ```
 
 **Passo 5: Calcular expoente privado d**
@@ -307,10 +307,12 @@ openssl x509 -req -days 365 -in csr.pem \
 # 4. Verificar certificado
 openssl x509 -in ec-certificate.pem -text -noout | grep "Public Key Algorithm"
 # Saída: Public Key Algorithm: id-ecPublicKey
+# (Algoritmo de chave pública: id-ecPublicKey)
 
 # 5. Ver curva utilizada
 openssl x509 -in ec-certificate.pem -text -noout | grep "ASN1 OID"
 # Saída: ASN1 OID: prime256v1
+# (Curva utilizada: prime256v1)
 ```
 
 ### Vantagens e Desvantagens de ECC
@@ -380,7 +382,12 @@ import hashlib
 
 def pbes1_derive_key(password, salt, iterations, hash_algo='md5'):
     """
-    PBES#1 Key Derivation (simplificado)
+    PBES#1 Key Derivation (simplificado para ilustração)
+    
+    ATENÇÃO: Esta é uma ilustração conceitual e NÃO representa 
+    a implementação completa do PBES#1. O algoritmo real deriva 
+    tanto a chave quanto o IV (Initialization Vector) e aplica 
+    as iterações de forma diferente. Não use este código em produção.
     """
     # Concatenar senha e salt
     data = password + salt
@@ -554,9 +561,11 @@ O número de iterações determina quantas vezes a função hash é aplicada. Ma
 
 | Algoritmo Hash | Iterações Mínimas | Recomendadas |
 |----------------|-------------------|--------------|
-| PBKDF2-HMAC-SHA1 | 720,000 | 1,300,000 |
-| PBKDF2-HMAC-SHA256 | 310,000 | 600,000 |
-| PBKDF2-HMAC-SHA512 | 120,000 | 210,000 |
+| PBKDF2-HMAC-SHA1 | 600,000 | 1,300,000 |
+| PBKDF2-HMAC-SHA256 | 600,000 | 1,300,000 |
+| PBKDF2-HMAC-SHA512 | 210,000 | 600,000 |
+
+**Nota:** Estes valores são baseados no OWASP Password Storage Cheat Sheet (2023-2024). Recomenda-se verificar as diretrizes mais recentes em https://cheatsheetseries.owasp.org/
 
 **Por que tantas iterações?**
 - Tornar ataques de força bruta impraticáveis
@@ -599,8 +608,10 @@ def calibrate_iterations(target_time=0.5, max_iterations=10000000):
         iterations = min(new_iterations, max_iterations)
         
         if iterations >= max_iterations:
+            print(f"⚠️ Atingiu limite máximo de {max_iterations} iterações sem alcançar tempo alvo de {target_time}s")
             return max_iterations
     
+    print(f"⚠️ Atingiu máximo de {max_attempts} tentativas. Usando {iterations} iterações.")
     return iterations
 
 recommended_iterations = calibrate_iterations(0.5)
@@ -742,12 +753,35 @@ aws secretsmanager create-secret \
     --name msk/client-key \
     --secret-string file://decrypted_key.pem
 
-# Dar permissão ao Lambda
-aws lambda add-permission \
+# Dar permissão ao Lambda para acessar Secrets Manager
+# Primeiro, obtenha o role do Lambda
+LAMBDA_ROLE=$(aws lambda get-function-configuration \
     --function-name my-function \
-    --statement-id SecretsManagerAccess \
-    --action secretsmanager:GetSecretValue \
-    --principal lambda.amazonaws.com
+    --query 'Role' --output text | sed 's:.*/::')
+
+# Anexe política ao role do Lambda
+aws iam attach-role-policy \
+    --role-name $LAMBDA_ROLE \
+    --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite
+
+# Ou para permissão mais restrita, crie política customizada:
+cat > /tmp/lambda-secrets-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:*:*:secret:msk/client-key*"
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+    --role-name $LAMBDA_ROLE \
+    --policy-name LambdaSecretsManagerAccess \
+    --policy-document file:///tmp/lambda-secrets-policy.json
 ```
 
 ### Comparação: PBES#1 vs PBES#2
@@ -756,7 +790,7 @@ aws lambda add-permission \
 |---------|--------|--------|
 | **Algoritmo Hash** | MD2, MD5, SHA-1 | Qualquer (SHA-256, SHA-512) |
 | **Criptografia** | DES, RC2 | AES, 3DES, etc. |
-| **Comprimento Chave** | Limitado (64 bits) | Flexível (128-256 bits) |
+| **Comprimento Chave** | Limitado pelo algoritmo (DES: 56 bits, RC2: variável) | Flexível (128-256 bits) |
 | **Salt** | 8 bytes fixos | Flexível (16+ bytes) |
 | **Iterações** | Tipicamente baixo | Alto (100k+) |
 | **Segurança** | ❌ Inseguro | ✅ Seguro |
@@ -807,7 +841,7 @@ aws lambda add-permission \
 **Uso na AWS:**
 ```bash
 # ACM Certificate Signature Algorithm
-aws acm describe-certificate --certificate-arn $ARN \
+aws acm describe-certificate --certificate-arn "$ARN" \
     --query 'Certificate.SignatureAlgorithm'
 # Saída: SHA256WITHRSA ou SHA256WITHECDSA
 ```
@@ -845,6 +879,20 @@ print(f"HMAC: {signature.hex()}")
 
 # Verificar
 def verify_hmac(key, message, signature):
+    """
+    Verifica assinatura HMAC de forma segura contra timing attacks.
+    
+    Args:
+        key: chave secreta (bytes)
+        message: mensagem original (bytes)
+        signature: assinatura a verificar (bytes)
+    
+    Returns:
+        bool: True se assinatura é válida
+    """
+    if not isinstance(signature, bytes):
+        raise TypeError("Signature must be bytes")
+    
     expected = hmac.new(key, message, hashlib.sha256).digest()
     return hmac.compare_digest(expected, signature)
 
@@ -892,10 +940,39 @@ aws elbv2 create-listener \
 | TLSv1.2_2021 | Forte | ✅ Recomendado |
 | TLSv1.3 | Muito forte | ✅ Moderno |
 
-**Configuração:**
+**Configuração (exemplo parcial - ViewerCertificate apenas):**
 ```bash
+# Nota: Este é um exemplo parcial mostrando apenas a configuração de certificado.
+# Uma distribuição CloudFront completa requer Origins, DefaultCacheBehavior, 
+# CallerReference e outros campos obrigatórios.
+
 aws cloudfront create-distribution \
     --distribution-config '{
+        "CallerReference": "my-dist-'$(date +%s)'",
+        "Comment": "Example distribution",
+        "Enabled": true,
+        "Origins": {
+            "Quantity": 1,
+            "Items": [{
+                "Id": "my-origin",
+                "DomainName": "example.com",
+                "CustomOriginConfig": {
+                    "HTTPPort": 80,
+                    "HTTPSPort": 443,
+                    "OriginProtocolPolicy": "https-only"
+                }
+            }]
+        },
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "my-origin",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "TrustedSigners": {"Enabled": false, "Quantity": 0},
+            "ForwardedValues": {
+                "QueryString": false,
+                "Cookies": {"Forward": "none"}
+            },
+            "MinTTL": 0
+        },
         "ViewerCertificate": {
             "ACMCertificateArn": "'$CERT_ARN'",
             "SSLSupportMethod": "sni-only",
@@ -936,7 +1013,9 @@ aws apigateway create-domain-name \
 | Python 3.9 | 1.1.1d | ⚠️ Limitado | Atualizar |
 | Python 3.10 | 1.1.1n | ⚠️ Parcial | Atualizar |
 | Python 3.11 | 1.1.1t | ✅ Suportado | ✅ Use |
-| Python 3.12 | 3.0.x | ✅ Completo | ✅ Melhor |
+| Python 3.12 | 3.0.8 | ✅ Completo | ✅ Melhor |
+
+**Nota:** As versões do OpenSSL podem variar conforme atualizações da AWS. Sempre consulte a [documentação oficial dos runtimes Lambda](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html) para informações atualizadas.
 
 **Workaround para runtimes antigos:**
 ```bash
@@ -953,7 +1032,7 @@ aws apigateway create-domain-name \
 
 **mTLS requirements:**
 - Certificado cliente em formato PEM
-- Chave privada sem senha ou com senha fraca
+- Chave privada sem senha (armazenada de forma segura, ex: AWS Secrets Manager)
 - CA raiz confiável
 
 **Problema comum:**
@@ -1097,9 +1176,14 @@ Lambda:
 
 **Automação:**
 ```bash
-# ACM renova automaticamente
-# Configurar alarme para certificados importados
+# ACM renova automaticamente certificados emitidos
+# Para certificados importados, monitore a expiração
 
+# Nota: A métrica DaysToExpiry do ACM requer configuração específica.
+# Verifique a documentação oficial da AWS para métricas de ACM disponíveis:
+# https://docs.aws.amazon.com/acm/latest/userguide/cloudwatch-metrics.html
+
+# Exemplo de alarme (verifique disponibilidade da métrica na sua região):
 aws cloudwatch put-metric-alarm \
     --alarm-name cert-expiring \
     --metric-name DaysToExpiry \
@@ -1107,7 +1191,11 @@ aws cloudwatch put-metric-alarm \
     --statistic Minimum \
     --period 86400 \
     --threshold 30 \
-    --comparison-operator LessThanThreshold
+    --comparison-operator LessThanThreshold \
+    --evaluation-periods 1
+
+# Alternativa: Use EventBridge para monitorar eventos ACM
+# ou crie função Lambda para verificar expiração periodicamente
 ```
 
 ### 5. Monitoramento
@@ -1116,7 +1204,7 @@ aws cloudwatch put-metric-alarm \
 
 ```python
 import boto3
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 def audit_certificates():
     """Auditar certificados ACM"""
@@ -1137,8 +1225,10 @@ def audit_certificates():
             warnings.append(f"⚠️ {details['DomainName']}: RSA 1024 inseguro")
         
         # Verificar expiração
+        # ACM retorna datetime timezone-aware, então usamos datetime.now(timezone.utc)
         not_after = details['NotAfter']
-        days_left = (not_after - datetime.now()).days
+        now = datetime.now(timezone.utc)
+        days_left = (not_after - now).days
         if days_left < 30:
             warnings.append(f"⚠️ {details['DomainName']}: Expira em {days_left} dias")
         
