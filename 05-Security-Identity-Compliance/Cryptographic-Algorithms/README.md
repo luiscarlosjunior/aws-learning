@@ -568,16 +568,19 @@ O número de iterações determina quantas vezes a função hash é aplicada. Ma
 import hashlib
 import time
 
-def calibrate_iterations(target_time=0.5):
+def calibrate_iterations(target_time=0.5, max_iterations=10000000):
     """
     Encontra número de iterações para atingir tempo alvo
     target_time: tempo desejado em segundos (0.5s recomendado)
+    max_iterations: limite máximo de iterações (padrão 10M)
     """
     password = b"test_password"
     salt = b"test_salt_12345"
     iterations = 10000
+    min_elapsed = 0.001  # Tempo mínimo para evitar divisão por valores muito pequenos
     
-    while True:
+    max_attempts = 20  # Limitar tentativas para evitar loop infinito
+    for attempt in range(max_attempts):
         start = time.time()
         hashlib.pbkdf2_hmac('sha256', password, salt, iterations, 32)
         elapsed = time.time() - start
@@ -585,8 +588,20 @@ def calibrate_iterations(target_time=0.5):
         if elapsed >= target_time:
             return iterations
         
+        # Proteger contra elapsed muito pequeno
+        if elapsed < min_elapsed:
+            elapsed = min_elapsed
+        
         # Aumentar iterações proporcionalmente
-        iterations = int(iterations * (target_time / elapsed))
+        new_iterations = int(iterations * (target_time / elapsed))
+        
+        # Aplicar limite máximo
+        iterations = min(new_iterations, max_iterations)
+        
+        if iterations >= max_iterations:
+            return max_iterations
+    
+    return iterations
 
 recommended_iterations = calibrate_iterations(0.5)
 print(f"Iterações recomendadas: {recommended_iterations}")
@@ -606,9 +621,11 @@ import os
 
 # Python
 salt = os.urandom(32)  # 32 bytes aleatórios
+```
 
-# Bash
-# openssl rand -hex 32  # 32 bytes em hexadecimal
+```bash
+# Bash/Shell
+openssl rand -hex 32  # 32 bytes em hexadecimal
 ```
 
 #### Função Hash (PRF)
