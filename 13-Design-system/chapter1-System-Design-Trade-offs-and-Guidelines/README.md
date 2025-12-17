@@ -2458,3 +2458,338 @@ Próximos Passos:
 - Kleppmann, M. (2017). *Designing Data-Intensive Applications*. O'Reilly Media.
 
 ---
+
+## 4. Consistency Versus Availability (Consistência Versus Disponibilidade)
+
+### Fundamentos Teóricos
+
+O trade-off entre consistência e disponibilidade é o mais fundamental em sistemas distribuídos, formalizado pelo Teorema CAP.
+
+**Teorema CAP (Brewer, 2000):**
+
+- **C (Consistency)**: Todos os nós veem os mesmos dados simultaneamente
+- **A (Availability)**: Toda requisição recebe resposta sem garantia de ser a mais recente
+- **P (Partition Tolerance)**: Sistema opera apesar de falhas de rede
+
+**Em caso de partição de rede (P), escolha entre:**
+1. **CP**: Retornar erro (sacrifica Availability)
+2. **AP**: Retornar dados desatualizados (sacrifica Consistency)
+
+**Referência:** Gilbert, S., & Lynch, N. (2002). "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services". *ACM SIGACT News*, 33(2), 51-59.
+
+### Modelos de Consistência
+
+#### Consistência Forte (Strong Consistency)
+
+Após escrita completar, todas as leituras veem o valor escrito. Usa consenso (Paxos/Raft).
+
+**Exemplo - Amazon RDS:**
+```python
+# Transação ACID garantida
+with db.transaction():
+    db.execute("UPDATE accounts SET balance = balance - 100 WHERE id = 1")
+    db.execute("UPDATE accounts SET balance = balance + 100 WHERE id = 2")
+# Ambas operações ou nenhuma
+
+# Trade-off:
+# - Latência: 50-200ms (espera consenso)
+# - Disponibilidade: Falha durante partições
+# - Garantia: Sempre dados corretos
+```
+
+#### Consistência Eventual (Eventual Consistency)
+
+Sem novas escritas, nós eventualmente convergem. Replica assincronamente.
+
+**Exemplo - DynamoDB (Eventually Consistent Reads):**
+```python
+# Leitura rápida mas possivelmente desatualizada
+response = table.get_item(
+    Key={'id': '123'},
+    ConsistentRead=False  # Padrão
+)
+
+# Trade-off:
+# - Latência: 5-10ms (não espera réplicas)
+# - Disponibilidade: Sempre responde
+# - Garantia: Dados podem estar desatualizados (<1s geralmente)
+```
+
+**Referência:** Vogels, W. (2009). "Eventually Consistent". *Communications of the ACM*, 52(1), 40-44.
+
+### Exemplos na AWS
+
+#### DynamoDB: Escolha por Operação
+
+```python
+# Eventually Consistent (padrão)
+# - 2x mais rápido
+# - 2x mais barato
+# - Dados possivelmente desatualizados
+response = table.get_item(Key={'id': '123'}, ConsistentRead=False)
+
+# Strongly Consistent
+# - Sempre dados mais recentes
+# - 2x custo e latência
+response = table.get_item(Key={'id': '123'}, ConsistentRead=True)
+```
+
+#### Amazon S3
+
+Desde 2020, S3 oferece strong consistency automaticamente:
+
+```python
+s3.put_object(Bucket='bucket', Key='file.txt', Body='data')
+# Leitura imediata SEMPRE retorna dados corretos
+response = s3.get_object(Bucket='bucket', Key='file.txt')
+```
+
+### Casos Reais
+
+#### Facebook TAO (AP System)
+
+**Escolha:** Disponibilidade > Consistência para social graph
+
+```python
+# Write assíncrono
+tao.create_edge(user_a, 'likes', post_x)
+# Replica para data centers globalmente
+
+# Read pode não ver like imediatamente
+likes = tao.get_edges(post_x, 'likes')
+
+# Trade-off Aceito:
+# - Usuário pode ver contagem de likes desatualizada (OK para UX)
+# - Sistema disponível mesmo com falha de data center inteiro
+```
+
+**Referência:** Bronson, N. et al. (2013). "TAO: Facebook's Distributed Data Store for the Social Graph". *USENIX ATC*.
+
+#### Sistema Bancário (CP System)
+
+**Escolha:** Consistência > Disponibilidade
+
+```python
+def transfer(from_account, to_account, amount):
+    try:
+        with db.transaction():
+            db.debit(from_account, amount)
+            db.credit(to_account, amount)
+        return {'status': 'success'}
+    except NetworkPartitionError:
+        # Durante partição: FALHA ao invés de inconsistência
+        return {'status': 'unavailable'}
+
+# Trade-off:
+# - Durante partição: Sistema indisponível
+# - Mas NUNCA dinheiro perdido ou duplicado
+# - Regulamentação exige consistência 100%
+```
+
+### Padrões de Design
+
+#### CQRS (Command Query Responsibility Segregation)
+
+Separa escritas (consistentes) de leituras (eventualmente consistentes):
+
+```python
+# Write Model - Strong Consistency
+class WriteModel:
+    def create_order(self, order):
+        with db.transaction():
+            db.insert('orders', order)
+        event_bus.publish('OrderCreated', order)
+
+# Read Model - Eventual Consistency
+class ReadModel:
+    def handle_order_created(self, order):
+        cache.set(f'order:{order.id}', order)
+        search.index('orders', order)
+    
+    def get_order(self, order_id):
+        return cache.get(f'order:{order_id}')  # Rápido
+
+# Trade-off:
+# - Writes: Lentas (50-200ms) mas consistentes
+# - Reads: Rápidas (1-10ms) mas eventualmente consistentes
+```
+
+**Referência:** Fowler, M. (2011). "CQRS". *Martin Fowler's Blog*.
+
+#### Saga Pattern
+
+Para transações distribuídas sem lock global:
+
+```python
+class OrderSaga:
+    def process_order(self, order):
+        try:
+            inventory.reserve(order.items)
+            payment.charge(order.payment)
+            shipping.create(order)
+            return {'status': 'success'}
+        except Exception:
+            # Compensating transactions
+            shipping.cancel(order)
+            payment.refund(order)
+            inventory.release(order)
+            return {'status': 'failed'}
+
+# Trade-off:
+# - Não requer locks distribuídos
+# - Eventual consistency (janela de inconsistência)
+# - Complexidade: Compensações para cada ação
+```
+
+**Referência:** Garcia-Molina, H., & Salem, K. (1987). "Sagas". *ACM SIGMOD Record*, 16(3), 249-259.
+
+### Princípios de Decisão
+
+**Quando Priorizar Consistência (CP):**
+- Dados financeiros (banking, payments)
+- Inventário crítico (evitar overselling)
+- Configurações de sistema críticas
+
+**Quando Priorizar Disponibilidade (AP):**
+- Social media (likes, comments)
+- Catálogo de produtos (preço pode estar desatualizado)
+- Analytics e métricas (eventual accuracy OK)
+
+### Perguntas para Entrevistas Técnicas
+
+#### Pergunta: Sistema de E-commerce com Inventário Limitado
+
+**Pergunta:**
+"Design um sistema que vende produtos com estoque limitado (100 unidades) esperando 10,000 req/s. Como garantir que não vende mais de 100 unidades? Discuta 3 abordagens."
+
+**Resposta Esperada:**
+
+**Abordagem 1: Strong Consistency (CP)**
+```python
+def purchase(product_id, quantity):
+    with db.transaction(isolation='SERIALIZABLE'):
+        stock = db.query("SELECT qty FROM inventory WHERE id=? FOR UPDATE", product_id)
+        if stock >= quantity:
+            db.execute("UPDATE inventory SET qty=qty-? WHERE id=?", quantity, product_id)
+            return {'status': 'success'}
+        return {'status': 'out_of_stock'}
+
+# Características:
+# - Garantia: ZERO overselling
+# - Throughput: 500-1000 TPS (locks limitam)
+# - Problema: Não atende 10,000 req/s
+```
+
+**Abordagem 2: Eventual Consistency (AP)**
+```python
+def purchase(product_id, quantity):
+    order_id = create_order(product_id, quantity)
+    queue.send({'type': 'decrement', 'product_id': product_id, 'quantity': quantity, 'order_id': order_id})
+    return {'status': 'processing', 'order_id': order_id}
+
+def process_inventory():
+    stock -= quantity
+    if stock < 0:
+        # Oversold! Cancelar pedidos
+        cancel_order(order_id)
+
+# Características:
+# - Throughput: 10,000+ TPS
+# - Problema: Overselling, clientes frustrados com cancelamentos
+```
+
+**Abordagem 3: Hybrid - Reservations (Recomendado)**
+```python
+def purchase(product_id, quantity):
+    # Reserva rápida em Redis (atomic)
+    reserved = redis.eval("""
+        if redis.call('GET', KEYS[1]) >= ARGV[1] then
+            redis.call('DECRBY', KEYS[1], ARGV[1])
+            return 1
+        else
+            return 0
+        end
+    """, f'inventory:{product_id}', quantity)
+    
+    if not reserved:
+        return {'status': 'out_of_stock'}
+    
+    # Criar pedido com expiração (15 minutos)
+    order_id = create_order_with_ttl(product_id, quantity, ttl=900)
+    return {'status': 'reserved', 'order_id': order_id, 'expires_in': 900}
+
+def confirm_purchase(order_id):
+    if payment_success:
+        db.commit_order(order_id)
+    else:
+        release_reservation(order_id)
+
+# Características:
+# - Throughput: 10,000+ TPS (Redis escala)
+# - Overselling: Mínimo (apenas janela de 15min)
+# - UX: Boa (usuário tem tempo para pagar)
+```
+
+**Comparação:**
+
+| Aspecto | Strong (CP) | Eventual (AP) | Hybrid |
+|---------|------------|---------------|--------|
+| Overselling | Zero | Possível | Mínimo |
+| Throughput | 500 TPS | 10K+ TPS | 10K+ TPS |
+| Latência | 50-500ms | 10-50ms | 5-20ms |
+| UX | Boa | Ruim | Boa |
+
+**Recomendação:** Abordagem 3 (Hybrid) balanceia todos os requisitos.
+
+---
+
+**Referências Principais:**
+- Brewer, E. A. (2000). "Towards Robust Distributed Systems". *PODC Keynote*.
+- Gilbert, S., & Lynch, N. (2002). "Brewer's Conjecture". *ACM SIGACT News*.
+- Vogels, W. (2009). "Eventually Consistent". *Communications of the ACM*.
+- Kleppmann, M. (2017). *Designing Data-Intensive Applications*. O'Reilly Media.
+- Bronson, N. et al. (2013). "TAO: Facebook's Distributed Data Store". *USENIX ATC*.
+
+---
+
+## Conclusão: System Design Trade-offs
+
+Os quatro trade-offs fundamentais — **Time vs Space**, **Latency vs Throughput**, **Performance vs Scalability**, e **Consistency vs Availability** — formam a base de toda decisão arquitetural em sistemas distribuídos.
+
+### Princípios Unificadores
+
+1. **Não Existe Solução Perfeita** - Todo design envolve sacrifícios
+2. **Medição é Fundamental** - "You can't improve what you don't measure"
+3. **Iteração Pragmática** - Comece simples, optimize conforme necessário
+4. **Entenda o Domínio** - Trade-offs técnicos devem alinhar com negócio
+
+### Framework de Decisão
+
+Ao enfrentar um trade-off, questione:
+
+1. **Qual o requisito mais crítico?** (Quantifique: "P99 < 100ms" vs "99.99% uptime")
+2. **Qual o custo de cada escolha?** (Monetário, complexidade, UX)
+3. **É reversível?** (Decisões reversíveis: Experimente rapidamente)
+4. **Pode ser híbrido?** (Frequentemente a melhor solução combina abordagens)
+
+### Aplicação Prática na AWS
+
+AWS oferece serviços que cobrem o espectro completo:
+
+**Time vs Space:** Lambda vs EC2, ElastiCache vs S3
+**Latency vs Throughput:** Lambda batch sizes, DynamoDB operations
+**Performance vs Scalability:** RDS vs Aurora, EC2 vs Auto Scaling
+**Consistency vs Availability:** RDS (CP) vs DynamoDB (AP tunable)
+
+### Evolução Contínua
+
+- **2007:** Dynamo introduz eventual consistency em escala
+- **2014:** Consensus algorithms simplificados (Raft)
+- **2020:** S3 adiciona strong consistency
+- **Futuro:** Novas abstrações simplificarão trade-offs
+
+Mantenha-se atualizado, mas aplique princípios fundamentais que permanecem constantes.
+
+---
+
+**Fonte:** System Design on AWS - Jayanth Kumar, Mandeep Singh
