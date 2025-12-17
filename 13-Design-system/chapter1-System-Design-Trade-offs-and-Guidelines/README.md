@@ -717,7 +717,9 @@ def fib_recursive(n):
     return fib_recursive(n-1) + fib_recursive(n-2)
 
 # Abordagem com Memoização: O(n) tempo, O(n) espaço
-def fib_memoized(n, memo={}):
+def fib_memoized(n, memo=None):
+    if memo is None:
+        memo = {}
     if n in memo:
         return memo[n]
     if n <= 1:
@@ -1879,7 +1881,7 @@ from functools import lru_cache
 
 class MultiTierCache:
     def __init__(self):
-        # L1: Local cache (pequeño, rápido)
+        # L1: Local cache (pequeno, rápido)
         self.local_cache = {}
         self.local_max_size = 100
         
@@ -1975,10 +1977,14 @@ class StatelessAPI:
     
     def handle_request(self, user_id, request):
         # Busca session de store compartilhado
-        session = self.session_store.get(f'session:{user_id}')
-        if not session:
+        session_data = self.session_store.get(f'session:{user_id}')
+        if not session_data:
             session = create_session(user_id)
-            self.session_store.setex(f'session:{user_id}', 3600, session)
+            # Serialize session before storing
+            self.session_store.setex(f'session:{user_id}', 3600, json.dumps(session))
+        else:
+            # Deserialize session from Redis (returns bytes)
+            session = json.loads(session_data)
         
         return process_with_session(session, request)
     
@@ -2702,14 +2708,16 @@ def process_inventory():
 ```python
 def purchase(product_id, quantity):
     # Reserva rápida em Redis (atomic)
-    reserved = redis.eval("""
-        if redis.call('GET', KEYS[1]) >= ARGV[1] then
+    lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if current >= tonumber(ARGV[1]) then
             redis.call('DECRBY', KEYS[1], ARGV[1])
             return 1
         else
             return 0
         end
-    """, f'inventory:{product_id}', quantity)
+    """
+    reserved = redis.eval(lua_script, 1, f'inventory:{product_id}', quantity)
     
     if not reserved:
         return {'status': 'out_of_stock'}
