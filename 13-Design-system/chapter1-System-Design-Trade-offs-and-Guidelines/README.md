@@ -2884,7 +2884,7 @@ Para armazenar configurações de usuário (< 1KB):
 - ❌ Complexo: Elasticsearch cluster
 - ❌ Complexo: RDS com schema normalizado
 - ✅ Simples: DynamoDB key-value
-- ✅ Mais simples ainda: S3 para volume baixo
+- ℹ️ Alternativas: AWS Systems Manager Parameter Store ou AppConfig para configurações muito estáticas
 
 A solução mais simples frequentemente é a melhor escolha inicial.
 
@@ -2894,7 +2894,7 @@ A solução mais simples frequentemente é a melhor escolha inicial.
 
 ### Conceito Fundamental
 
-Decisões de design devem ser baseadas em métricas reais, não em intuição ou premissa. "In God we trust, all others must bring data" (W. Edwards Deming).
+Decisões de design devem ser baseadas em métricas reais, não em intuição ou premissa. "In God we trust, all others must bring data" (frase frequentemente atribuída a W. Edwards Deming, embora a origem exata seja incerta).
 
 **Princípios de Medição:**
 
@@ -2973,7 +2973,7 @@ Para cada decisão, questione:
 - DynamoDB: Auto-scaling ilimitado, baixa latência | Trade-off: NoSQL, sem joins nativos
 
 **Exemplo 3: Consistency em DynamoDB**
-- Strongly Consistent Reads: Dados sempre atualizados | Trade-off: 2x custo, 2x latência
+- Strongly Consistent Reads: Dados sempre atualizados | Trade-off: 2x custo, latência ligeiramente maior
 - Eventually Consistent Reads: Mais rápido, mais barato | Trade-off: Dados possivelmente desatualizados
 
 **Exemplo Prático:**
@@ -3219,7 +3219,7 @@ Antes de decidir arquitetura, responda:
 
 1. **Fase 1**: Serverless/Monolito - Valide product-market fit
 2. **Fase 2**: Monolito modular - Escale com simplicidade
-3. **Fase 3**: Extraia services críticos - Decompõe gradualmente
+3. **Fase 3**: Extraia services críticos - Decomponha gradualmente
 4. **Fase 4**: Microservices full - Se e quando necessário
 
 **Nunca:**
