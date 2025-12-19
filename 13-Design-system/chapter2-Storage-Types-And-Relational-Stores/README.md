@@ -2046,7 +2046,7 @@ Aumentar recursos da máquina (CPU, RAM, disco).
 ```python
 # Progression de vertical scaling:
 
-# Desenvolvimento
+# Workloads muito pequenos ou desenvolvimento
 db.t3.micro = {
     'vcpu': 2,
     'ram_gb': 1,
