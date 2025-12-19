@@ -1761,6 +1761,7 @@ class QueryCache:
     
     def cached_query(self, sql, params):
         # Gerar cache key do SQL + params
+        # MD5 é usado aqui apenas para geração rápida de chave de cache, não para fins de segurança/criptografia.
         cache_key = hashlib.md5(f"{sql}{params}".encode()).hexdigest()
         
         # Tentar buscar do cache
