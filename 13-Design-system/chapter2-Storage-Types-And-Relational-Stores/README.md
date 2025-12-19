@@ -1732,7 +1732,7 @@ SELECT * FROM users WHERE email = 'john@example.com';
 # ❌ Ruim: N+1 queries
 orders = db.query("SELECT * FROM orders LIMIT 100")
 for order in orders:
-    customer = db.query(f"SELECT * FROM customers WHERE id = {order.customer_id}")
+    customer = db.query("SELECT * FROM customers WHERE id = %s", (order.customer_id,))
     # 1 query para orders + 100 queries para customers = 101 queries
 # Time: 100 × 5ms = 500ms
 
