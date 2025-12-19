@@ -2477,7 +2477,7 @@ rds.create_db_instance(
     Engine='postgres',
     EngineVersion='15.3',
     MasterUsername='admin',
-    MasterUserPassword='SecurePassword123!',
+    MasterUserPassword=get_password_from_secrets_manager(),  # Não hardcode senhas; use um secrets manager
     AllocatedStorage=100,
     StorageType='gp3',
     StorageEncrypted=True,
