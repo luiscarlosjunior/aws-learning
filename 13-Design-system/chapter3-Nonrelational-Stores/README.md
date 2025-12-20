@@ -1099,6 +1099,3629 @@ class CacheLayer:
 # Trade-off: Volatile (data lost on restart, unless persistence enabled)
 ```
 
+---
+
+## Key-Value Databases (Bancos de Dados Chave-Valor)
+
+Key-Value databases representam o modelo de armazenamento NoSQL mais fundamental e eficiente. Como observa DeCandia et al. no paper seminal "Dynamo: Amazon's Highly Available Key-value Store" (2007): "A chave é usada para determinar o nó de armazenamento, e o valor pode ser um blob opaco sem schema definido". Este design minimalista oferece performance excepcional e escalabilidade massiva.
+
+### Data Model (Modelo de Dados)
+
+#### Conceitos Fundamentais
+
+O modelo de dados de um Key-Value store é conceitualmente simples mas incrivelmente poderoso:
+
+**Estrutura Básica:**
+```
+Key → Value
+```
+
+Cada item no banco é identificado por uma **chave única** que mapeia para um **valor**. A chave é o único meio de acesso aos dados, e o valor é tipicamente opaco para o sistema de armazenamento.
+
+**Características do Modelo:**
+
+```python
+class KeyValueDataModel:
+    """
+    Representação conceitual do modelo Key-Value
+    """
+    def __init__(self):
+        # Estrutura interna: Hash table distribuído
+        self.data_store = {}
+    
+    # API Minimalista
+    def put(self, key: str, value: any) -> bool:
+        """
+        Armazena ou atualiza um valor
+        - Key: String única (max 2KB no DynamoDB)
+        - Value: Objeto opaco (max 400KB no DynamoDB)
+        - Complexidade: O(1)
+        """
+        self.data_store[key] = value
+        return True
+    
+    def get(self, key: str) -> any:
+        """
+        Recupera um valor pela chave
+        - Complexidade: O(1)
+        - Retorna None se key não existe
+        """
+        return self.data_store.get(key)
+    
+    def delete(self, key: str) -> bool:
+        """
+        Remove um item
+        - Complexidade: O(1)
+        """
+        if key in self.data_store:
+            del self.data_store[key]
+            return True
+        return False
+    
+    def exists(self, key: str) -> bool:
+        """
+        Verifica existência de uma chave
+        - Complexidade: O(1)
+        """
+        return key in self.data_store
+
+# Propriedades do Modelo:
+# 1. Acesso exclusivo por chave (sem queries complexas)
+# 2. Valor é opaco (store não interpreta estrutura interna)
+# 3. Sem relacionamentos entre items
+# 4. Sem índices secundários nativos (algumas implementações adicionam)
+# 5. Atomic operations em nível de item
+```
+
+#### Tipos de Valores
+
+Key-Value stores suportam diversos tipos de valores:
+
+**1. String Values (Redis)**
+
+```python
+import redis
+
+r = redis.Redis()
+
+# String simples
+r.set('user:1000:name', 'João Silva')
+
+# Número como string
+r.set('user:1000:age', '35')
+
+# JSON serializado
+import json
+user_data = {'name': 'João', 'email': 'joao@example.com', 'age': 35}
+r.set('user:1000', json.dumps(user_data))
+
+# Binary data (imagens, documentos)
+with open('profile.jpg', 'rb') as f:
+    r.set('user:1000:photo', f.read())
+
+# Benefício: Flexibilidade total no valor
+# Trade-off: Aplicação deve serializar/deserializar
+```
+
+**2. Structured Values (DynamoDB)**
+
+```python
+import boto3
+from decimal import Decimal
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('Users')
+
+# Valor estruturado (map)
+table.put_item(
+    Item={
+        'user_id': 'user1000',  # Key
+        # Value: Structured data
+        'name': 'João Silva',
+        'email': 'joao@example.com',
+        'age': 35,
+        'balance': Decimal('1500.50'),
+        'preferences': {
+            'language': 'pt-BR',
+            'notifications': True,
+            'theme': 'dark'
+        },
+        'tags': ['premium', 'verified'],
+        'created_at': '2024-01-15T10:30:00Z'
+    }
+)
+
+# DynamoDB suporta tipos:
+# - String, Number, Binary
+# - Boolean, Null
+# - List, Map (nested)
+# - String Set, Number Set, Binary Set
+
+# Benefício: Rich data types, sem serialização manual
+# Trade-off: Tamanho máximo 400KB por item
+```
+
+**3. Data Structures (Redis)**
+
+Redis oferece estruturas de dados nativas além de strings:
+
+```python
+import redis
+
+r = redis.Redis()
+
+# LISTS - Sequências ordenadas
+r.lpush('user:1000:notifications', 'Nova mensagem')
+r.lpush('user:1000:notifications', 'Pagamento aprovado')
+recent_notifications = r.lrange('user:1000:notifications', 0, 9)  # Top 10
+
+# SETS - Coleções únicas, não ordenadas
+r.sadd('user:1000:interests', 'tecnologia', 'esportes', 'música')
+r.sadd('user:2000:interests', 'esportes', 'viagens', 'música')
+# Interseção: Interesses comuns
+common = r.sinter('user:1000:interests', 'user:2000:interests')
+# Result: {'esportes', 'música'}
+
+# SORTED SETS - Sets ordenados por score
+r.zadd('game:leaderboard', {
+    'user1000': 9500,
+    'user2000': 8700,
+    'user3000': 9200
+})
+top_players = r.zrevrange('game:leaderboard', 0, 2, withscores=True)
+# Result: [('user1000', 9500), ('user3000', 9200), ('user2000', 8700)]
+
+# HASHES - Mapas de campo-valor
+r.hset('user:1000:profile', mapping={
+    'name': 'João Silva',
+    'email': 'joao@example.com',
+    'city': 'São Paulo'
+})
+email = r.hget('user:1000:profile', 'email')
+
+# BITMAPS - Arrays compactos de bits
+# Tracking: Usuário fez login nos últimos 365 dias?
+r.setbit('user:1000:login_days', 0, 1)   # Dia 0: Sim
+r.setbit('user:1000:login_days', 1, 0)   # Dia 1: Não
+r.setbit('user:1000:login_days', 2, 1)   # Dia 2: Sim
+active_days = r.bitcount('user:1000:login_days')  # Total de dias ativos
+
+# HYPERLOGLOGS - Contagem aproximada de elementos únicos
+# Tracking: Unique visitors
+r.pfadd('page:home:visitors:2024-01-15', 'user1000', 'user2000', 'user1000')
+unique_count = r.pfcount('page:home:visitors:2024-01-15')  # 2 (deduplicated)
+
+# Benefícios: Operações especializadas, eficiência de memória
+# Trade-offs: Mais complexidade, Redis-specific
+```
+
+#### Key Design Patterns
+
+Design de chaves é crítico para performance e escalabilidade:
+
+**Padrão 1: Hierarchical Keys**
+
+```python
+# Pattern: entity:id:attribute
+# Benefícios: Namespace claro, evita colisões
+
+# User data
+r.set('user:1000:name', 'João Silva')
+r.set('user:1000:email', 'joao@example.com')
+r.set('user:1000:last_login', '2024-01-15T10:30:00Z')
+
+# Product data
+r.set('product:5678:name', 'Laptop Dell')
+r.set('product:5678:price', '2999.99')
+r.set('product:5678:stock', '45')
+
+# Order data
+r.set('order:9012:user_id', '1000')
+r.set('order:9012:total', '2999.99')
+r.set('order:9012:status', 'shipped')
+
+# Scan pattern: Listar todas as keys de um namespace
+keys = r.keys('user:1000:*')  # Todas as keys do user 1000
+# Warning: keys() é O(N), evitar em produção!
+# Alternativa: Manter índice separado
+```
+
+**Padrão 2: Composite Keys**
+
+```python
+# Pattern: entity:attribute:value
+# Use case: Índices secundários, lookups reversos
+
+# Index: Email → User ID
+r.set('user:email:joao@example.com', '1000')
+
+# Lookup: Encontrar user_id por email
+email = 'joao@example.com'
+user_id = r.get(f'user:email:{email}')  # '1000'
+
+# Então buscar dados completos
+user_data = r.get(f'user:{user_id}')
+
+# Index: Product category
+r.sadd('product:category:laptops', '5678', '5679', '5680')
+r.sadd('product:category:phones', '1234', '1235', '1236')
+
+# Query: Todos os produtos da categoria laptops
+laptop_ids = r.smembers('product:category:laptops')
+
+# Benefício: Simula índices secundários
+# Trade-off: Manutenção manual dos índices
+```
+
+**Padrão 3: Time-based Keys**
+
+```python
+from datetime import datetime
+
+# Pattern: entity:date:id
+# Use case: Time-series data, logs, events
+
+# Logs por dia
+today = datetime.now().strftime('%Y-%m-%d')
+r.lpush(f'logs:errors:{today}', 'Error message 1')
+r.lpush(f'logs:errors:{today}', 'Error message 2')
+
+# Metrics por hora
+hour = datetime.now().strftime('%Y-%m-%d:%H')
+r.incr(f'metrics:page_views:{hour}')
+r.incr(f'metrics:api_calls:{hour}')
+
+# TTL automático: Logs expiram após 7 dias
+r.expire(f'logs:errors:{today}', 7 * 24 * 60 * 60)  # 7 dias em segundos
+
+# Agregação: Total de page views hoje
+hours = [f'metrics:page_views:{today}:{h:02d}' for h in range(24)]
+total_views = sum(int(r.get(h) or 0) for h in hours)
+
+# Benefício: Particionamento temporal, cleanup automático
+# Trade-off: Queries cross-time complexas
+```
+
+**Padrão 4: Versioned Keys**
+
+```python
+# Pattern: entity:id:version
+# Use case: Imutabilidade, histórico, cache busting
+
+# Versão atual
+r.set('config:app:current', '3')
+r.set('config:app:v3', json.dumps({
+    'api_url': 'https://api.example.com/v3',
+    'timeout': 30,
+    'retry_count': 3
+}))
+
+# Versões antigas mantidas
+r.set('config:app:v2', json.dumps({...}))
+r.set('config:app:v1', json.dumps({...}))
+
+# Read: Sempre buscar versão atual
+current_version = r.get('config:app:current')
+config = json.loads(r.get(f'config:app:v{current_version}'))
+
+# Update: Criar nova versão, não sobrescrever
+r.set('config:app:v4', json.dumps({...}))
+r.set('config:app:current', '4')
+
+# Rollback: Fácil
+r.set('config:app:current', '3')
+
+# Cache busting: URLs com versão
+image_version = '5'
+image_url = f'https://cdn.example.com/product/1000/photo.jpg?v={image_version}'
+
+# Benefícios: Imutabilidade, auditoria, rollback fácil
+# Trade-offs: Mais armazenamento, cleanup manual de versões antigas
+```
+
+#### Limitações do Modelo
+
+Entender as limitações é essencial para design apropriado:
+
+```python
+class KeyValueLimitations:
+    """
+    Demonstração de limitações e workarounds
+    """
+    
+    # Limitação 1: Sem queries por valor
+    def query_by_value_problem(self):
+        """
+        Problem: Encontrar todos users com age > 30
+        """
+        # Impossível em Key-Value puro!
+        # Não há como query por atributos do valor
+        
+        # Workaround 1: Scan completo (lento!)
+        all_users = []
+        for key in r.scan_iter('user:*:age'):  # Scan todas as keys
+            age = int(r.get(key))
+            if age > 30:
+                user_id = key.split(':')[1]
+                all_users.append(user_id)
+        # O(N) - Inaceitável para grandes datasets
+        
+        # Workaround 2: Manter índice secundário
+        # Durante write:
+        def create_user(user_id, age):
+            r.set(f'user:{user_id}:age', age)
+            # Adicionar ao índice de idade
+            r.zadd('users:by_age', {user_id: age})
+        
+        # Query eficiente:
+        users_over_30 = r.zrangebyscore('users:by_age', 30, '+inf')
+        # O(log(N) + M) onde M = resultado size
+        
+        # Trade-off: Manutenção manual de índices
+    
+    # Limitação 2: Sem relacionamentos
+    def relationships_problem(self):
+        """
+        Problem: User tem múltiplas orders, order tem múltiplos items
+        """
+        # Impossível fazer JOIN!
+        
+        # Solução 1: Denormalização
+        user_data = {
+            'user_id': '1000',
+            'name': 'João',
+            'recent_orders': [  # Embedded
+                {
+                    'order_id': '9001',
+                    'date': '2024-01-10',
+                    'total': 299.99,
+                    'items': [  # Nested
+                        {'product': 'Mouse', 'price': 29.99},
+                        {'product': 'Keyboard', 'price': 270.00}
+                    ]
+                }
+            ]
+        }
+        r.set('user:1000', json.dumps(user_data))
+        
+        # Benefício: 1 read para tudo
+        # Trade-off: Duplicação, inconsistência potencial
+        
+        # Solução 2: Application-level JOINs
+        def get_user_orders(user_id):
+            # Read 1: User
+            user = json.loads(r.get(f'user:{user_id}'))
+            
+            # Read 2: Order IDs
+            order_ids = r.smembers(f'user:{user_id}:orders')
+            
+            # Read 3-N: Cada order
+            orders = []
+            for order_id in order_ids:
+                order = json.loads(r.get(f'order:{order_id}'))
+                orders.append(order)
+            
+            user['orders'] = orders
+            return user
+        
+        # Trade-off: N+2 queries (N+1 problem)
+    
+    # Limitação 3: Sem transações multi-key (Redis)
+    def multi_key_transaction_problem(self):
+        """
+        Problem: Transferir saldo entre duas contas atomicamente
+        """
+        # Solução: Redis transactions (limited)
+        pipe = r.pipeline()
+        
+        try:
+            # WATCH: Detecta modificações concorrentes
+            pipe.watch('account:1000:balance', 'account:2000:balance')
+            
+            # Verificar saldos
+            balance_1 = Decimal(pipe.get('account:1000:balance'))
+            balance_2 = Decimal(pipe.get('account:2000:balance'))
+            
+            amount = Decimal('100.00')
+            if balance_1 < amount:
+                raise InsufficientFundsError()
+            
+            # Transaction
+            pipe.multi()
+            pipe.decrbyfloat('account:1000:balance', float(amount))
+            pipe.incrbyfloat('account:2000:balance', float(amount))
+            pipe.execute()
+            
+            return "Transfer successful"
+            
+        except redis.WatchError:
+            # Concurrent modification detected
+            # Retry necessário
+            return "Conflict, retry"
+        
+        # Limitações:
+        # - Não há rollback automático
+        # - Watch/Multi/Exec é optimistic locking
+        # - Complexidade alta para desenvolvedores
+        
+        # Alternativa: Use banco com ACID para casos críticos
+    
+    # Limitação 4: Sem agregações
+    def aggregation_problem(self):
+        """
+        Problem: Calcular média de preços de produtos
+        """
+        # Impossível em Key-Value puro
+        
+        # Workaround: Manter agregações pré-computadas
+        def add_product(product_id, price):
+            # Armazenar produto
+            r.set(f'product:{product_id}:price', price)
+            
+            # Atualizar agregação
+            pipe = r.pipeline()
+            pipe.incrbyfloat('products:total_price', price)
+            pipe.incr('products:count')
+            pipe.execute()
+        
+        def get_average_price():
+            total = Decimal(r.get('products:total_price'))
+            count = int(r.get('products:count'))
+            return total / count if count > 0 else 0
+        
+        # Trade-off: Agregações devem ser antecipadas no design
+
+# Real-world Example: Quando NÃO usar Key-Value
+use_cases_not_suitable = {
+    'Complex Queries': 'Usar SQL ou Document DB',
+    'Ad-hoc Analytics': 'Usar Redshift ou BigQuery',
+    'Graph Relationships': 'Usar Neptune',
+    'Rich Transactions': 'Usar PostgreSQL',
+    'Full-text Search': 'Usar Elasticsearch'
+}
+
+# When TO use Key-Value:
+use_cases_ideal = {
+    'Session Storage': 'Simple, fast, TTL support',
+    'Caching': 'Ultra-low latency, high throughput',
+    'Real-time Counters': 'Atomic increments',
+    'Leaderboards': 'Sorted sets',
+    'Rate Limiting': 'Counters + TTL',
+    'Shopping Carts': 'Temporary data, high availability'
+}
+```
+
+### Data Access and Retrieval Operations (Operações de Acesso e Recuperação de Dados)
+
+Key-Value databases oferecem operações simples mas extremamente eficientes para acesso a dados.
+
+#### Operações Básicas
+
+**1. PUT/SET - Escrita de Dados**
+
+```python
+class KeyValueWriteOperations:
+    """
+    Operações de escrita em Key-Value stores
+    """
+    
+    # DynamoDB PUT
+    def dynamodb_put(self, item):
+        """
+        PUT: Create or Replace item completamente
+        """
+        table.put_item(
+            Item={
+                'user_id': 'user1000',
+                'name': 'João Silva',
+                'email': 'joao@example.com',
+                'age': 35,
+                'created_at': '2024-01-15T10:30:00Z'
+            }
+        )
+        # Comportamento: Sobrescreve item existente completamente
+        # Performance: 5-15ms
+        # Custo: 1 WCU (Write Capacity Unit) para items ≤ 1KB
+    
+    # DynamoDB UPDATE
+    def dynamodb_update(self, user_id):
+        """
+        UPDATE: Modifica atributos específicos
+        """
+        table.update_item(
+            Key={'user_id': user_id},
+            UpdateExpression='SET #name = :name, age = age + :inc',
+            ExpressionAttributeNames={'#name': 'name'},  # 'name' é palavra reservada
+            ExpressionAttributeValues={
+                ':name': 'João Silva Oliveira',
+                ':inc': 1
+            },
+            ReturnValues='ALL_NEW'  # Retorna item após update
+        )
+        # Benefício: Atomic updates, não precisa read-modify-write
+        # Performance: 5-15ms
+        # Custo: 1 WCU mesmo modificando só 1 atributo
+    
+    # Conditional Writes
+    def conditional_write(self, user_id):
+        """
+        Conditional PUT: Write somente se condição satisfeita
+        """
+        try:
+            table.put_item(
+                Item={
+                    'user_id': user_id,
+                    'status': 'active',
+                    'version': 2
+                },
+                ConditionExpression='attribute_not_exists(user_id) OR version < :new_version',
+                ExpressionAttributeValues={':new_version': 2}
+            )
+            return "Write successful"
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                return "Condition not met - write rejected"
+        
+        # Use cases:
+        # - Prevent overwriting: attribute_not_exists(key)
+        # - Optimistic locking: version matching
+        # - Business rules: balance >= withdrawal_amount
+        
+        # Performance: Mesma latência, mas pode falhar
+    
+    # Redis SET
+    def redis_set_operations(self):
+        """
+        Redis SET com opções avançadas
+        """
+        # SET básico
+        r.set('user:1000:name', 'João Silva')
+        
+        # SET com TTL (expira automaticamente)
+        r.setex('session:abc123', 3600, json.dumps({'user_id': '1000'}))
+        # TTL: 1 hora
+        
+        # SET condicional: Só se key não existe (NX = Not eXists)
+        success = r.set('user:1000:email', 'joao@example.com', nx=True)
+        # True se criou, False se key já existia
+        
+        # SET condicional: Só se key existe (XX = eXists)
+        success = r.set('user:1000:email', 'new@example.com', xx=True)
+        # True se atualizou, False se key não existia
+        
+        # SET com GET antigo (GETSET pattern)
+        old_value = r.getset('counter', '100')
+        # Atomicamente: retorna valor antigo + seta novo
+        
+        # SET múltiplo (atomic)
+        r.mset({
+            'user:1000:name': 'João',
+            'user:1000:email': 'joao@example.com',
+            'user:1000:age': '35'
+        })
+        # Performance: 1 round-trip para múltiplos sets
+
+# Atomic Counters
+class AtomicCounters:
+    """
+    Contadores atômicos - operação crucial em Key-Value stores
+    """
+    
+    # DynamoDB Atomic Counter
+    def dynamodb_counter(self):
+        """
+        Incremento atômico sem race conditions
+        """
+        response = table.update_item(
+            Key={'page_id': 'home'},
+            UpdateExpression='ADD view_count :inc',
+            ExpressionAttributeValues={':inc': 1},
+            ReturnValues='UPDATED_NEW'
+        )
+        new_count = response['Attributes']['view_count']
+        
+        # Garantias:
+        # - Atomic: Não há race condition
+        # - No read before write: Mais eficiente
+        # - Safe com concorrência: Múltiplos clients incrementando
+        
+        # Use cases:
+        # - Page views, API calls
+        # - Like counts, vote counts
+        # - Inventory management
+        
+        # Performance: 10-15ms
+        # Throughput: Limitado pela partition (3000 WCU/s max)
+    
+    # Redis Atomic Counter
+    def redis_counter(self):
+        """
+        Incremento atômico ultra-rápido
+        """
+        # INCR: Incrementa por 1
+        new_count = r.incr('page:home:views')
+        # Performance: 0.1-0.3ms
+        
+        # INCRBY: Incrementa por N
+        new_count = r.incrby('api:calls', 10)
+        
+        # INCRBYFLOAT: Incrementa decimal
+        new_balance = r.incrbyfloat('account:1000:balance', 50.25)
+        
+        # DECR: Decrementa por 1
+        remaining = r.decr('inventory:product123')
+        
+        # Atomic pattern: Reserve inventory
+        remaining = r.decr('inventory:product123')
+        if remaining < 0:
+            # Oversold! Rollback
+            r.incr('inventory:product123')
+            return "Out of stock"
+        else:
+            return f"Reserved! {remaining} remaining"
+        
+        # Performance: 100,000+ ops/second por node
+        # Thread-safe: Sem locks necessários
+```
+
+**2. GET - Leitura de Dados**
+
+```python
+class KeyValueReadOperations:
+    """
+    Operações de leitura eficientes
+    """
+    
+    # DynamoDB GET
+    def dynamodb_get(self, user_id):
+        """
+        GET: Recupera item por chave
+        """
+        # Eventual consistency (default, mais rápido)
+        response = table.get_item(
+            Key={'user_id': user_id}
+        )
+        item = response.get('Item')
+        # Performance: 2-5ms
+        # Custo: 0.5 RCU (Read Capacity Unit) para items ≤ 4KB
+        
+        # Strong consistency (garantia de ler última versão)
+        response = table.get_item(
+            Key={'user_id': user_id},
+            ConsistentRead=True
+        )
+        item = response.get('Item')
+        # Performance: 5-10ms (2x mais lento)
+        # Custo: 1 RCU (2x mais caro)
+        
+        # Projection: Ler apenas atributos específicos
+        response = table.get_item(
+            Key={'user_id': user_id},
+            ProjectionExpression='#name, email, age',
+            ExpressionAttributeNames={'#name': 'name'}
+        )
+        # Benefício: Menos data transfer, mesma RCU
+        
+        return item
+    
+    # Batch GET
+    def batch_get_dynamodb(self, user_ids):
+        """
+        Batch GET: Múltiplos items em uma request
+        """
+        response = dynamodb_client.batch_get_item(
+            RequestItems={
+                'Users': {
+                    'Keys': [{'user_id': uid} for uid in user_ids],
+                    'ProjectionExpression': 'user_id, #name, email',
+                    'ExpressionAttributeNames': {'#name': 'name'}
+                }
+            }
+        )
+        
+        items = response['Responses']['Users']
+        
+        # Limitações:
+        # - Max 100 items por request
+        # - Max 16 MB de data total
+        # - Items podem vir de múltiplas tables
+        
+        # Performance: 10-30ms para 100 items
+        # vs 100 individual GETs: 200-500ms
+        # Speedup: 10-20x
+        
+        # Unprocessed items: Retry necessário
+        unprocessed = response.get('UnprocessedKeys', {})
+        if unprocessed:
+            # Recursivamente processar unprocessed
+            retry_response = dynamodb_client.batch_get_item(
+                RequestItems=unprocessed
+            )
+            items.extend(retry_response['Responses']['Users'])
+        
+        return items
+    
+    # Redis GET
+    def redis_get(self):
+        """
+        Redis GET: Ultra-rápido
+        """
+        # GET simples
+        value = r.get('user:1000:name')  # bytes
+        name = value.decode('utf-8')  # string
+        # Performance: 0.1-0.5ms
+        
+        # MGET: Múltiplas keys
+        values = r.mget([
+            'user:1000:name',
+            'user:1000:email',
+            'user:1000:age'
+        ])
+        # Performance: 0.2-1ms para 10-100 keys
+        # 1 round-trip vs N round-trips
+        
+        # GET com fallback
+        def get_with_fallback(key, fallback_fn):
+            value = r.get(key)
+            if value is None:
+                # Cache miss: Compute e cache
+                value = fallback_fn()
+                r.setex(key, 3600, value)  # Cache 1 hora
+            return value
+        
+        # EXISTS: Verificar existência sem ler valor
+        exists = r.exists('user:1000:name')  # 1 se existe, 0 se não
+        # Performance: 0.1ms
+        # Use case: Verificação leve antes de operação pesada
+        
+        # TTL: Verificar tempo restante
+        ttl_seconds = r.ttl('session:abc123')
+        # -1: Key existe, sem expiry
+        # -2: Key não existe
+        # N: Segundos até expirar
+
+# Scan Operations (use with caution!)
+class ScanOperations:
+    """
+    Scan: Iterar sobre múltiplos items
+    Atenção: Operação cara, evitar em hot paths
+    """
+    
+    # DynamoDB Scan
+    def dynamodb_scan(self):
+        """
+        Scan: Lê toda a tabela sequencialmente
+        """
+        # Scan básico (evitar!)
+        response = table.scan()
+        items = response['Items']
+        
+        # Pagination: Tabelas grandes requerem múltiplas requests
+        all_items = []
+        last_evaluated_key = None
+        
+        while True:
+            if last_evaluated_key:
+                response = table.scan(ExclusiveStartKey=last_evaluated_key)
+            else:
+                response = table.scan()
+            
+            all_items.extend(response['Items'])
+            
+            last_evaluated_key = response.get('LastEvaluatedKey')
+            if not last_evaluated_key:
+                break  # Scan completo
+        
+        # Performance: Lento! Lê 1MB por request
+        # - Tabela 10GB: ~10,000 requests, minutos
+        # - Consome RCUs massivamente
+        
+        # Scan com filtro (ainda lento)
+        response = table.scan(
+            FilterExpression='age > :min_age',
+            ExpressionAttributeValues={':min_age': 30}
+        )
+        # Atenção: Filtro aplicado DEPOIS de ler dados
+        # Consome RCUs de TODOS os items lidos, não só os filtrados!
+        
+        # Parallel Scan: Dividir scan entre workers
+        def parallel_scan_segment(segment, total_segments):
+            response = table.scan(
+                Segment=segment,
+                TotalSegments=total_segments
+            )
+            return response['Items']
+        
+        # Executar 4 workers em paralelo
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(parallel_scan_segment, i, 4)
+                for i in range(4)
+            ]
+            all_items = []
+            for future in futures:
+                all_items.extend(future.result())
+        
+        # Speedup: 4x mais rápido
+        # Trade-off: 4x mais RCU consumption rate
+    
+    # Redis SCAN
+    def redis_scan(self):
+        """
+        Redis SCAN: Iteração segura sobre keys
+        """
+        # SCAN: Cursor-based iteration
+        cursor = 0
+        all_keys = []
+        
+        while True:
+            cursor, keys = r.scan(cursor, match='user:*', count=100)
+            all_keys.extend(keys)
+            
+            if cursor == 0:
+                break  # Iteração completa
+        
+        # Propriedades:
+        # - Não bloqueia: Safe em produção
+        # - Pode retornar duplicatas: Application deve deduplicate
+        # - Não garante snapshot: Keys criados/deletados durante scan
+        
+        # KEYS: Evitar em produção!
+        keys = r.keys('user:*')  # Bloqueia Redis até completar!
+        # Use somente em desenvolvimento/debugging
+        
+        # Alternativa: Manter índice
+        # Durante write, adicionar key ao set
+        r.set('user:1000:name', 'João')
+        r.sadd('all_user_keys', 'user:1000:name')  # Índice
+        
+        # Listar todas as keys instantaneamente
+        all_keys = r.smembers('all_user_keys')
+        # Performance: O(N) onde N = número de keys, mas sem bloqueio
+
+# Advanced: Query Patterns
+class QueryPatterns:
+    """
+    Padrões de query apesar das limitações
+    """
+    
+    def begins_with_query(self):
+        """
+        Query: Todas as sessions de um usuário
+        """
+        # DynamoDB: Sort key com begins_with
+        response = table.query(
+            KeyConditionExpression='user_id = :uid AND begins_with(session_id, :prefix)',
+            ExpressionAttributeValues={
+                ':uid': 'user1000',
+                ':prefix': '2024-01'  # Sessions de Janeiro 2024
+            }
+        )
+        # Performance: 10-50ms, escalável
+        # Requer: Sort key com formato hierárquico
+        
+        # Redis: SCAN com pattern matching
+        cursor = 0
+        matching_keys = []
+        while True:
+            cursor, keys = r.scan(
+                cursor,
+                match='session:user1000:2024-01*',
+                count=100
+            )
+            matching_keys.extend(keys)
+            if cursor == 0:
+                break
+    
+    def range_query(self):
+        """
+        Query: Range de valores
+        """
+        # DynamoDB: Sort key range
+        response = table.query(
+            KeyConditionExpression='user_id = :uid AND #timestamp BETWEEN :start AND :end',
+            ExpressionAttributeNames={'#timestamp': 'timestamp'},
+            ExpressionAttributeValues={
+                ':uid': 'user1000',
+                ':start': '2024-01-01T00:00:00Z',
+                ':end': '2024-01-31T23:59:59Z'
+            }
+        )
+        # Eficiente: Usa índice ordenado
+        
+        # Redis: Sorted sets
+        # Store data com timestamp como score
+        r.zadd('user:1000:events', {
+            'event1': 1704067200,  # Unix timestamp
+            'event2': 1704153600,
+            'event3': 1704240000
+        })
+        
+        # Query: Events em range de tempo
+        events = r.zrangebyscore(
+            'user:1000:events',
+            1704067200,  # Start timestamp
+            1704240000   # End timestamp
+        )
+        # Performance: O(log(N) + M), muito eficiente
+    
+    def secondary_index_pattern(self):
+        """
+        Simular secondary index
+        """
+        # Problema: Buscar user por email (not primary key)
+        
+        # Solução 1: Maintain reverse index
+        def create_user(user_id, email):
+            # Write user data
+            table.put_item(Item={
+                'user_id': user_id,
+                'email': email,
+                'name': 'João'
+            })
+            
+            # Write reverse index
+            table.put_item(Item={
+                'email': email,  # Key na index table
+                'user_id': user_id
+            })
+        
+        def find_user_by_email(email):
+            # Lookup index
+            response = index_table.get_item(Key={'email': email})
+            user_id = response['Item']['user_id']
+            
+            # Fetch user data
+            response = table.get_item(Key={'user_id': user_id})
+            return response['Item']
+        
+        # Trade-off: 2 queries, manutenção de índice
+        
+        # Solução 2: DynamoDB Global Secondary Index (GSI)
+        # Definido na criação da table
+        # Automaticamente mantido pelo DynamoDB
+        response = table.query(
+            IndexName='EmailIndex',
+            KeyConditionExpression='email = :email',
+            ExpressionAttributeValues={':email': 'joao@example.com'}
+        )
+        # Benefício: Single query, sem manutenção manual
+        # Trade-off: Eventual consistency, custo extra
+```
+
+**3. DELETE - Remoção de Dados**
+
+```python
+class KeyValueDeleteOperations:
+    """
+    Operações de deleção
+    """
+    
+    # DynamoDB DELETE
+    def dynamodb_delete(self, user_id):
+        """
+        DELETE: Remove item
+        """
+        # Delete simples
+        table.delete_item(Key={'user_id': user_id})
+        # Performance: 5-15ms
+        # Custo: 1 WCU
+        
+        # Delete condicional
+        try:
+            table.delete_item(
+                Key={'user_id': user_id},
+                ConditionExpression='#status = :inactive',
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={':inactive': 'inactive'}
+            )
+            return "Deleted successfully"
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                return "Condition not met - item not deleted"
+        
+        # Delete com retorno do item deletado
+        response = table.delete_item(
+            Key={'user_id': user_id},
+            ReturnValues='ALL_OLD'
+        )
+        deleted_item = response.get('Attributes')
+        # Use case: Audit log, undo operations
+    
+    # Batch DELETE
+    def batch_delete_dynamodb(self, user_ids):
+        """
+        Batch delete: Múltiplos items
+        """
+        with table.batch_writer() as batch:
+            for user_id in user_ids:
+                batch.delete_item(Key={'user_id': user_id})
+        
+        # Limitações:
+        # - Max 25 items por batch
+        # - Não suporta conditional deletes
+        # - Partial failures possíveis (retry necessário)
+        
+        # Performance: 20-50ms para 25 items
+        # vs 25 individual deletes: 125-375ms
+    
+    # Redis DELETE
+    def redis_delete(self):
+        """
+        Redis DELETE: Ultra-rápido
+        """
+        # DELETE single key
+        deleted = r.delete('user:1000:name')
+        # Returns: Número de keys deletadas (1 ou 0)
+        # Performance: 0.1ms
+        
+        # DELETE múltiplas keys
+        deleted_count = r.delete(
+            'user:1000:name',
+            'user:1000:email',
+            'user:1000:age'
+        )
+        # Returns: Total de keys deletadas
+        
+        # UNLINK: Async delete (não bloqueia)
+        r.unlink('large_key_with_millions_of_items')
+        # Benefício: Delete de estruturas grandes não bloqueia
+        # Background thread remove data
+        
+        # Delete por pattern (perigoso!)
+        keys_to_delete = []
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match='temp:*', count=100)
+            keys_to_delete.extend(keys)
+            if cursor == 0:
+                break
+        
+        if keys_to_delete:
+            r.delete(*keys_to_delete)
+        # Atenção: Use com cuidado, pode deletar muitos dados!
+    
+    # TTL-based expiration (auto-delete)
+    def ttl_expiration(self):
+        """
+        Expiração automática via TTL
+        """
+        # DynamoDB TTL (gratuito!)
+        # Configurar na table: TTL attribute = 'expires_at'
+        
+        # Write com TTL
+        import time
+        ttl_timestamp = int(time.time()) + 86400  # 24 horas
+        
+        table.put_item(
+            Item={
+                'session_id': 'abc123',
+                'user_id': 'user1000',
+                'expires_at': ttl_timestamp  # Unix timestamp
+            }
+        )
+        # DynamoDB deleta automaticamente após expires_at
+        # Delay: Até 48 horas após expiration (eventual deletion)
+        
+        # Redis TTL (preciso)
+        # SET com expiry
+        r.setex('session:abc123', 3600, 'data')  # Expira em 1 hora
+        
+        # Ou EXPIRE em key existente
+        r.set('session:xyz789', 'data')
+        r.expire('session:xyz789', 3600)  # 1 hora
+        
+        # Check TTL restante
+        ttl = r.ttl('session:abc123')
+        # -1: Sem expiry
+        # -2: Key não existe (já expirou)
+        # N: Segundos restantes
+        
+        # Remove TTL
+        r.persist('session:abc123')  # Torna key permanente
+        
+        # Benefícios:
+        # - Cleanup automático (no manual delete)
+        # - Ideal para dados temporários
+        # - Cache invalidation automática
+```
+
+#### Performance Optimization Patterns
+
+```python
+class PerformanceOptimizations:
+    """
+    Padrões de otimização para Key-Value operations
+    """
+    
+    # 1. Connection Pooling
+    def connection_pooling(self):
+        """
+        Reutilizar conexões para reduzir overhead
+        """
+        # Redis connection pool
+        pool = redis.ConnectionPool(
+            host='redis.amazonaws.com',
+            port=6379,
+            max_connections=50,  # Pool size
+            decode_responses=True
+        )
+        r = redis.Redis(connection_pool=pool)
+        
+        # Benefício: Evita overhead de TCP handshake
+        # New connection: 5-20ms overhead
+        # Pooled connection: <1ms overhead
+        
+        # DynamoDB: Cliente já usa connection pooling internamente
+        dynamodb_client = boto3.client('dynamodb')
+        # Reutilize cliente, não crie novo a cada request
+    
+    # 2. Pipeline/Batching
+    def pipelining(self):
+        """
+        Agrupar múltiplas operações em uma round-trip
+        """
+        # Redis pipeline
+        pipe = r.pipeline()
+        pipe.set('key1', 'value1')
+        pipe.set('key2', 'value2')
+        pipe.incr('counter')
+        pipe.get('key1')
+        results = pipe.execute()
+        # 1 round-trip vs 4 round-trips
+        # Speedup: 3-10x dependendo de network latency
+        
+        # DynamoDB batch operations
+        with table.batch_writer() as batch:
+            for i in range(100):
+                batch.put_item(Item={'id': f'item{i}', 'data': '...'})
+        # Automatically batches em requests de 25 items
+        # Speedup: 10-25x vs individual writes
+    
+    # 3. Caching Strategies
+    def caching_strategies(self):
+        """
+        Padrões de cache para otimizar reads
+        """
+        # Cache-Aside (Lazy Loading)
+        def get_user_cache_aside(user_id):
+            # Try cache first
+            cached = r.get(f'user:{user_id}')
+            if cached:
+                return json.loads(cached)  # Cache hit
+            
+            # Cache miss: Load from DB
+            user = table.get_item(Key={'user_id': user_id})['Item']
+            
+            # Store in cache
+            r.setex(f'user:{user_id}', 3600, json.dumps(user))
+            
+            return user
+        
+        # Write-Through
+        def update_user_write_through(user_id, updates):
+            # Write to DB first
+            table.update_item(
+                Key={'user_id': user_id},
+                UpdateExpression='SET #name = :name',
+                ExpressionAttributeNames={'#name': 'name'},
+                ExpressionAttributeValues={':name': updates['name']}
+            )
+            
+            # Update cache
+            user = table.get_item(Key={'user_id': user_id})['Item']
+            r.setex(f'user:{user_id}', 3600, json.dumps(user))
+        
+        # Write-Behind (Async)
+        def update_user_write_behind(user_id, updates):
+            # Update cache immediately
+            user = json.loads(r.get(f'user:{user_id}'))
+            user.update(updates)
+            r.setex(f'user:{user_id}', 3600, json.dumps(user))
+            
+            # Queue DB write (async)
+            queue.put({
+                'operation': 'update_user',
+                'user_id': user_id,
+                'updates': updates
+            })
+            # Background worker processa queue
+            
+            # Benefício: Latência mínima (1-2ms)
+            # Trade-off: Eventual consistency, risk of data loss
+    
+    # 4. Read Replicas (Redis)
+    def read_replicas(self):
+        """
+        Distribuir reads entre replicas
+        """
+        # Redis Cluster com replicas
+        from rediscluster import RedisCluster
+        
+        startup_nodes = [
+            {"host": "redis-master.aws.com", "port": 6379},
+            {"host": "redis-replica1.aws.com", "port": 6379},
+            {"host": "redis-replica2.aws.com", "port": 6379}
+        ]
+        
+        rc = RedisCluster(
+            startup_nodes=startup_nodes,
+            decode_responses=True,
+            readonly_mode=True  # Permite reads de replicas
+        )
+        
+        # Reads: Distribuídos entre master e replicas
+        value = rc.get('key')  # Pode ler de qualquer node
+        
+        # Writes: Sempre vão para master
+        rc.set('key', 'value')  # Vai para master
+        
+        # Benefício: 3x read throughput
+        # Trade-off: Eventual consistency (replication lag ~1-10ms)
+    
+    # 5. Compression
+    def compression(self):
+        """
+        Comprimir valores grandes para economizar storage e bandwidth
+        """
+        import gzip
+        import json
+        
+        def set_compressed(key, data):
+            # Serialize e compress
+            json_data = json.dumps(data).encode('utf-8')
+            compressed = gzip.compress(json_data)
+            
+            r.set(key, compressed)
+            # Savings: 50-90% dependendo dos dados
+        
+        def get_compressed(key):
+            # Retrieve e decompress
+            compressed = r.get(key)
+            if compressed:
+                json_data = gzip.decompress(compressed)
+                return json.loads(json_data)
+            return None
+        
+        # Trade-off:
+        # - Storage: 50-90% menor
+        # - CPU: +1-5ms para compress/decompress
+        # - Use para valores >10KB
+
+# Performance Metrics Cheatsheet
+performance_cheatsheet = {
+    'DynamoDB': {
+        'GET (eventual)': '2-5ms',
+        'GET (strong)': '5-10ms',
+        'PUT/UPDATE': '5-15ms',
+        'DELETE': '5-15ms',
+        'Batch (25 items)': '20-50ms',
+        'Query': '10-50ms',
+        'Scan (1MB)': '100-500ms'
+    },
+    'Redis': {
+        'GET': '0.1-0.5ms',
+        'SET': '0.1-0.5ms',
+        'INCR': '0.1-0.3ms',
+        'DELETE': '0.1ms',
+        'MGET (10 keys)': '0.2-1ms',
+        'ZADD/ZRANGE': '0.2-1ms',
+        'Pipeline (10 ops)': '0.5-2ms'
+    },
+    'Network Overhead': {
+        'Same AZ': '0.5-1ms',
+        'Cross AZ': '1-3ms',
+        'Cross Region': '50-150ms',
+        'TCP Handshake': '5-20ms',
+        'TLS Handshake': '10-30ms'
+    }
+}
+```
+
+### Scaling Key-Value Stores (Escalabilidade em Armazenamentos Chave-Valor)
+
+A escalabilidade é uma das principais vantagens dos Key-Value stores. Eles foram projetados desde o início para escalar horizontalmente de forma eficiente.
+
+#### Horizontal Partitioning (Sharding)
+
+**Conceito Fundamental:**
+
+Dados são distribuídos entre múltiplos nodes baseado em uma função de hash da chave. Este processo, chamado de particionamento ou sharding, é transparente para a aplicação.
+
+```python
+class HorizontalPartitioning:
+    """
+    Como Key-Value stores distribuem dados entre nodes
+    """
+    
+    def __init__(self, nodes):
+        self.nodes = nodes  # Lista de nodes no cluster
+        self.num_nodes = len(nodes)
+    
+    # Particionamento Simples: Modulo Hashing
+    def simple_hash_partition(self, key):
+        """
+        Particionamento básico: hash(key) % num_nodes
+        """
+        hash_value = hash(key)
+        node_index = hash_value % self.num_nodes
+        target_node = self.nodes[node_index]
+        
+        return target_node
+    
+    # Problema com simple hashing:
+    def problem_with_modulo(self):
+        """
+        Adicionar/remover node requer redistribuir TODOS os dados
+        """
+        # Cenário: 3 nodes inicialmente
+        # key='user1000' → hash=12345 → 12345 % 3 = 0 → node0
+        
+        # Adicionar 4º node
+        # key='user1000' → hash=12345 → 12345 % 4 = 1 → node1 ❌
+        # TODOS as keys mudam de node!
+        
+        # Problema: Rebalanceamento massivo (horas/dias para TB de dados)
+        pass
+    
+    # Solução: Consistent Hashing
+    def consistent_hashing(self, key):
+        """
+        Consistent hashing: Apenas 1/N dos dados movem ao adicionar node
+        """
+        from hashlib import md5
+        
+        # Hash ring: Círculo de 0 a 2^128
+        # Nodes e keys são mapeados no ring
+        
+        # 1. Hash da key
+        key_hash = int(md5(key.encode()).hexdigest(), 16)
+        
+        # 2. Encontrar primeiro node >= key_hash no ring
+        # (clockwise no ring)
+        target_node = self._find_node_on_ring(key_hash)
+        
+        return target_node
+    
+    def _find_node_on_ring(self, key_hash):
+        """
+        Encontra node responsável pela key no hash ring
+        """
+        # Sorted list de node positions no ring
+        # Binário search para eficiência: O(log N)
+        
+        # Pseudo-code:
+        # if key_hash > all node positions:
+        #     return first_node  # Wrap around
+        # else:
+        #     return next_node_clockwise
+        pass
+    
+    # Benefícios do Consistent Hashing:
+    benefits = {
+        'Add Node': 'Apenas 1/N dos dados redistribuídos',
+        'Remove Node': 'Apenas dados daquele node redistribuídos',
+        'Minimal Disruption': 'Maioria das keys não movem',
+        'Load Distribution': 'Virtual nodes para balanceamento uniforme'
+    }
+
+# Real Implementation: Amazon DynamoDB
+class DynamoDBPartitioning:
+    """
+    Como DynamoDB particiona dados
+    """
+    
+    def partition_key_hashing(self):
+        """
+        DynamoDB usa MD5 hash da partition key
+        """
+        # Table: Users
+        # Partition Key: user_id
+        
+        # Write: user_id='user1000'
+        # 1. MD5 hash: md5('user1000') → 128-bit hash
+        # 2. Determina partition baseado em hash
+        # 3. Escreve em partition específica
+        
+        # Propriedades:
+        # - Uniform distribution (se keys bem distribuídas)
+        # - Deterministic (mesma key → mesma partition sempre)
+        # - Transparente (application não sabe qual partition)
+        
+        # Hot Partition Problem:
+        hot_partition_example = """
+        Problem: 80% dos requests vão para 1 partition
+        
+        Causa: Partition key mal escolhida
+        - Exemplo: status='active' (maioria dos users)
+        - Exemplo: date='2024-01-15' (todos writes hoje)
+        
+        Consequência:
+        - 1 partition: 3000 WCU/s máximo
+        - Throttling em outras partitions idle
+        
+        Solução: Adicionar suffix randômico
+        - partition_key = 'status_active_' + random(1, 10)
+        - Distribui load entre 10 partitions
+        - Trade-off: Queries mais complexas
+        """
+        
+        return hot_partition_example
+    
+    def adaptive_capacity(self):
+        """
+        DynamoDB Adaptive Capacity: Mitigação automática de hot partitions
+        """
+        # Cenário: Partition A está hot (3000 WCU/s)
+        #          Partition B está fria (100 WCU/s)
+        
+        # DynamoDB automaticamente:
+        # 1. Detecta hot partition
+        # 2. "Empresta" capacidade de partitions frias
+        # 3. Hot partition pode usar até 300 segundos de burst
+        
+        # Benefício: Tolera spikes temporários
+        # Limitação: Não resolve hot partitions permanentes
+        
+        # Best practice: Design partition key para distribuição uniforme
+        good_partition_keys = [
+            'user_id',  # Muitos users, acesso distribuído
+            'device_id',  # Muitos devices, acesso distribuído
+            'order_id',  # IDs únicos, acesso distribuído
+        ]
+        
+        bad_partition_keys = [
+            'status',  # Poucos valores, acesso concentrado
+            'country',  # Poucos valores (se users concentrados)
+            'date',  # Todos writes vão para partition de hoje
+        ]
+
+# Virtual Nodes (Cassandra)
+class VirtualNodes:
+    """
+    Cassandra usa virtual nodes para balanceamento fino
+    """
+    
+    def vnodes_concept(self):
+        """
+        Cada physical node possui múltiplos virtual nodes (vnodes)
+        """
+        # Tradicional: 1 physical node = 1 posição no hash ring
+        # Problem: Desbalanceamento se nodes têm capacidades diferentes
+        
+        # VNodes: 1 physical node = 256 posições no hash ring (default)
+        # Benefício: Balanceamento muito mais fino
+        
+        # Exemplo:
+        # Cluster: 3 physical nodes (A, B, C)
+        # Cada node: 256 vnodes
+        # Total: 768 vnodes no ring
+        
+        # Data distribution:
+        # - Aproximadamente 256 vnodes por node
+        # - Pequenas variações (±5%) são normais
+        # - Balanceamento automático
+        
+        # Add node D:
+        # - D recebe ~256 vnodes
+        # - Distribuídos uniformemente no ring
+        # - Cada existing node doa ~85 vnodes para D
+        # - Apenas 1/4 dos dados movem (vs 1/3 no exemplo acima)
+        
+        # Benefício: Rebalanceamento muito mais rápido
+        # Node grande: Pode ter mais vnodes (ex: 512 vs 256)
+    
+    def token_allocation(self):
+        """
+        Como tokens (positions no ring) são alocados
+        """
+        import random
+        
+        # Random token allocation (Cassandra 3.0+)
+        def allocate_tokens(num_vnodes=256):
+            max_token = 2**63  # 64-bit token space
+            tokens = []
+            for _ in range(num_vnodes):
+                token = random.randint(-max_token, max_token-1)
+                tokens.append(token)
+            return sorted(tokens)
+        
+        # Physical node A: tokens [123, 5678, 91011, ...]
+        # Physical node B: tokens [456, 7890, 10111, ...]
+        # Physical node C: tokens [789, 8901, 11121, ...]
+        
+        # Key placement:
+        # key='user1000' → hash → token=6500
+        # Find next token clockwise: 7890 (node B)
+        # Write to node B (and replicas)
+
+#### Replication for Scalability
+
+```python
+class ReplicationForScalability:
+    """
+    Replicação não é apenas para availability, mas também para scalability
+    """
+    
+    # Read Scalability via Replicas
+    def read_replicas(self):
+        """
+        Distribuir reads entre múltiplas replicas
+        """
+        # Cassandra: RF=3 (3 replicas por partition)
+        # - Replica A (primary)
+        # - Replica B (secondary)
+        # - Replica C (secondary)
+        
+        # Read com CL=ONE:
+        # - Coordinator escolhe replica mais próxima
+        # - Distribui reads entre A, B, C
+        # - Read throughput: 3x vs single replica
+        
+        # Trade-off: Eventual consistency
+        # - Replica pode estar ligeiramente desatualizada
+        # - Acceptable para maioria dos use cases
+        
+        # Read throughput scaling:
+        # RF=1: 1x read capacity
+        # RF=3: 3x read capacity (com CL=ONE)
+        # RF=5: 5x read capacity (com CL=ONE)
+    
+    # DynamoDB Global Tables
+    def global_tables_scalability(self):
+        """
+        Replicação multi-region para scalability global
+        """
+        # Setup: Global table em 3 regiões
+        # - us-east-1
+        # - eu-west-1
+        # - ap-southeast-1
+        
+        # Writes: Cada região aceita writes localmente
+        # - US users: Write para us-east-1 (10ms)
+        # - EU users: Write para eu-west-1 (10ms)
+        # - APAC users: Write para ap-southeast-1 (10ms)
+        # vs single region: 100-300ms cross-region latency
+        
+        # Reads: Cada região responde localmente
+        # - Global read capacity = Sum of all regions
+        # - 10K RCU/s × 3 regions = 30K RCU/s global
+        
+        # Benefícios:
+        # - Low latency worldwide
+        # - Linear scalability: Add region = Add capacity
+        # - Disaster recovery automático
+        
+        # Trade-offs:
+        # - 3x cost (3 replicas)
+        # - Eventual consistency cross-region
+        # - Conflict resolution necessário
+
+#### Auto-Scaling
+
+```python
+class AutoScaling:
+    """
+    Escalabilidade automática baseada em demanda
+    """
+    
+    # DynamoDB Auto Scaling
+    def dynamodb_auto_scaling(self):
+        """
+        DynamoDB ajusta capacidade automaticamente
+        """
+        # Configuration:
+        auto_scaling_config = {
+            'target_utilization': 70,  # Target 70% utilization
+            'min_capacity': 5,  # Minimum RCU/WCU
+            'max_capacity': 1000,  # Maximum RCU/WCU
+            'scale_up_policy': {
+                'cooldown': 60,  # 60 segundos entre scale-ups
+                'increment': '20%'  # Aumenta 20% por vez
+            },
+            'scale_down_policy': {
+                'cooldown': 300,  # 5 minutos entre scale-downs
+                'decrement': '10%'  # Reduz 10% por vez
+            }
+        }
+        
+        # Comportamento:
+        # - Load aumenta: Auto-scaling aumenta capacity
+        # - Load diminui: Auto-scaling reduz capacity (mais lento)
+        # - Proteção contra thrashing: Cooldown periods
+        
+        # Performance:
+        # - Scale-up: 1-3 minutos para aplicar
+        # - Scale-down: 5-15 minutos para aplicar
+        
+        # Limitações:
+        # - Não previne throttling durante spikes súbitos
+        # - Melhor para workloads graduais
+        
+        # Alternativa: On-Demand pricing
+        # - Sem planejamento de capacity
+        # - Paga por request (mais caro por request)
+        # - Ideal para workloads imprevisíveis
+    
+    # Redis Cluster Scaling
+    def redis_cluster_scaling(self):
+        """
+        Redis Cluster: Escalabilidade horizontal
+        """
+        # Initial setup: 3 master nodes
+        # - Master 0: Hash slots 0-5461
+        # - Master 1: Hash slots 5462-10922
+        # - Master 2: Hash slots 10923-16383
+        
+        # Add 4th master node:
+        # 1. Add new node to cluster
+        # 2. Rebalance hash slots
+        #    - Master 0: 0-4095 (cede slots 4096-5461)
+        #    - Master 1: 4096-8191 (cede slots 8192-10922)
+        #    - Master 2: 8192-12287 (cede slots 12288-16383)
+        #    - Master 3: 12288-16383 (recebe slots redistributed)
+        # 3. Migrate data para novo node
+        # 4. Cluster rebalanced
+        
+        # Downtime: Zero (rolling migration)
+        # Time: 10-60 minutos dependendo de data size
+        
+        # Scalability limit:
+        # - Max 1000 nodes por cluster
+        # - 16,384 hash slots total
+        # - Cada node: ~16 slots (com 1000 nodes)
+        
+        # Write throughput scaling:
+        # 3 masters: 300K ops/s
+        # 6 masters: 600K ops/s
+        # 10 masters: 1M ops/s
+        # Linear scalability!
+
+#### Performance Under Scale
+
+```python
+class PerformanceAtScale:
+    """
+    Como performance muda com escala
+    """
+    
+    def latency_characteristics(self):
+        """
+        Latência em diferentes escalas
+        """
+        performance_by_scale = {
+            'Single Node Redis': {
+                '10K ops/s': '0.1-0.3ms P99',
+                '50K ops/s': '0.2-0.5ms P99',
+                '100K ops/s': '0.5-2ms P99',  # CPU bound
+                '200K ops/s': 'Throttling/Errors'
+            },
+            
+            'DynamoDB Small Table (<10GB)': {
+                '100 RCU/s': '3-8ms P99',
+                '1000 RCU/s': '5-15ms P99',
+                '10000 RCU/s': '8-25ms P99'
+            },
+            
+            'DynamoDB Large Table (>1TB)': {
+                '100K RCU/s': '10-30ms P99',
+                '500K RCU/s': '15-50ms P99',
+                '1M RCU/s': '25-100ms P99',
+                # Multiple partitions: Mais variabilidade
+            },
+            
+            'Cassandra Cluster (10 nodes)': {
+                '10K ops/s': '5-15ms P99',
+                '100K ops/s': '10-30ms P99',
+                '500K ops/s': '20-60ms P99',
+                '1M ops/s': '30-100ms P99'
+            }
+        }
+        
+        # Observações:
+        # - Latência aumenta com throughput (queuing)
+        # - Latência aumenta com data size (mais partitions)
+        # - P99 latência >> P50 latência (tail latency)
+        # - Variabilidade aumenta com escala
+        
+        return performance_by_scale
+    
+    def scaling_best_practices(self):
+        """
+        Best practices para scaling Key-Value stores
+        """
+        best_practices = {
+            'Partition Key Design': [
+                'Distribuição uniforme: Evitar hot keys',
+                'High cardinality: Muitos valores únicos',
+                'Predictable access: User ID melhor que status',
+                'Consider composite keys: user_id + timestamp'
+            ],
+            
+            'Data Modeling': [
+                'Denormalize para evitar joins',
+                'Pre-compute aggregations',
+                'Use secondary indexes com cuidado (custo)',
+                'TTL para auto-cleanup de dados temporários'
+            ],
+            
+            'Read Optimization': [
+                'Cache frequently accessed data (Redis)',
+                'Use eventual consistency quando possível',
+                'Batch reads com batch_get_item',
+                'Projection para ler apenas campos necessários'
+            ],
+            
+            'Write Optimization': [
+                'Batch writes com batch_write_item',
+                'Async writes quando possível',
+                'Compress large items (>10KB)',
+                'Avoid hot partitions: Shard busy keys'
+            ],
+            
+            'Monitoring': [
+                'Track throttled requests',
+                'Monitor partition key distribution',
+                'Alert on high latency (P99)',
+                'Capacity utilization alarms'
+            ],
+            
+            'Capacity Planning': [
+                'Size for peak load + 20% buffer',
+                'Use auto-scaling para gradual changes',
+                'Pre-warm partitions antes de eventos grandes',
+                'Consider on-demand para spiky workloads'
+            ]
+        }
+        
+        return best_practices
+
+# Real-world Scaling Example
+class ScalingExample:
+    """
+    Exemplo: Escalar sessão store de 10K para 1M users
+    """
+    
+    def initial_setup(self):
+        """
+        Setup inicial: 10K concurrent users
+        """
+        setup = {
+            'service': 'DynamoDB',
+            'table': 'UserSessions',
+            'partition_key': 'session_id',
+            'item_size': '2KB',
+            
+            'workload': {
+                'reads': '100/s',  # Cada user: 1 read a cada 100s
+                'writes': '10/s',  # Session updates
+                'sessions_per_user': 1,
+                'concurrent_users': 10000
+            },
+            
+            'capacity': {
+                'RCU': 50,  # 50 reads/s × 2KB/4KB = 25 RCU
+                'WCU': 20,  # 10 writes/s × 2KB/1KB = 20 WCU
+                'cost': '$12/month'  # Provisioned capacity
+            },
+            
+            'performance': {
+                'p50_latency': '3-5ms',
+                'p99_latency': '10-20ms',
+                'throttling': '0%'
+            }
+        }
+        return setup
+    
+    def scaled_setup(self):
+        """
+        Scaled up: 1M concurrent users (100x)
+        """
+        setup = {
+            'service': 'DynamoDB',
+            'table': 'UserSessions',
+            'partition_key': 'session_id',  # Mesma strategy, escala bem
+            
+            'workload': {
+                'reads': '10000/s',  # 100x
+                'writes': '1000/s',  # 100x
+                'concurrent_users': 1000000
+            },
+            
+            'capacity': {
+                'RCU': 5000,  # 100x (10K reads/s × 2KB/4KB ×  0.5)
+                'WCU': 2000,  # 100x (1K writes/s × 2KB/1KB × 2)
+                'cost': '$1,200/month',  # Provisioned capacity
+                # Alternativa: On-demand = $1,800/month
+            },
+            
+            'architecture_changes': [
+                'Added Redis cache layer',
+                '80% cache hit rate',
+                'DynamoDB only for cache misses + writes',
+                'Actual DynamoDB load: 2K RCU, 2K WCU',
+                'Cost optimizado: $500/month DynamoDB + $100 Redis'
+            ],
+            
+            'performance': {
+                'p50_latency': '5-10ms',  # Slightly higher
+                'p99_latency': '20-50ms',  # Tail latency degradation
+                'throttling': '<0.1%'  # Minimal com adaptive capacity
+            }
+        }
+        return setup
+```
+
+### Availability in Key-Value Stores (Disponibilidade em Armazenamentos Chave-Valor)
+
+Disponibilidade é um pilar fundamental dos Key-Value stores, especialmente em sistemas críticos que não podem tolerar downtime.
+
+#### Replication Strategies
+
+```python
+class ReplicationStrategies:
+    """
+    Estratégias de replicação para alta disponibilidade
+    """
+    
+    # Synchronous Replication (Strong Consistency)
+    def synchronous_replication(self):
+        """
+        Write só confirma após replicar para múltiplos nodes
+        """
+        # DynamoDB: Cross-AZ synchronous replication
+        def write_with_sync_replication(key, value):
+            # 1. Write enviado para partition leader
+            leader_node.write(key, value)
+            
+            # 2. Leader replica para 2 outros AZs (synchronously)
+            responses = []
+            responses.append(az1_replica.write(key, value))
+            responses.append(az2_replica.write(key, value))
+            
+            # 3. Aguarda QUORUM (2 de 3) antes de confirmar
+            successful = sum(1 for r in responses if r.success)
+            
+            if successful >= 2:
+                return "Write committed"  # Durável em ≥2 AZs
+            else:
+                return "Write failed"  # Rollback
+            
+            # Performance: 10-20ms (inclui replication latency)
+            # Availability: Pode escrever com 1 AZ down
+            # Durability: 11 noves (99.999999999%)
+        
+        # Propriedades:
+        # - Strong consistency: Reads sempre veem últimas writes
+        # - Durável: Dados replicados antes de ACK
+        # - Lento: Latência de replicação no critical path
+        # - Less available: Requer quorum para writes
+    
+    # Asynchronous Replication (Eventual Consistency)
+    def asynchronous_replication(self):
+        """
+        Write confirma imediatamente, replica em background
+        """
+        # Cassandra (with CL=ONE)
+        def write_with_async_replication(key, value):
+            # 1. Write para node local
+            local_node.write(key, value)
+            
+            # 2. Retorna sucesso IMEDIATAMENTE
+            # (sem esperar replicas)
+            
+            # 3. Background: Async replication para replicas
+            async def replicate_background():
+                replica1.write(key, value)
+                replica2.write(key, value)
+            
+            asyncio.create_task(replicate_background())
+            
+            return "Write accepted"  # Rápido!
+            
+            # Performance: 1-5ms (sem esperar replicas)
+            # Availability: Sempre disponível (mesmo com failures)
+            # Consistency: Eventual (replication lag ~10-100ms)
+            # Risk: Data loss se node crashes antes de replicar
+        
+        # Propriedades:
+        # - Fast writes: Latência mínima
+        # - High availability: Aceita writes com failures
+        # - Eventual consistency: Reads podem ver dados antigos
+        # - Durability risk: Potencial data loss
+
+#### Failure Detection and Handling
+
+```python
+class FailureDetection:
+    """
+    Como Key-Value stores detectam e tratam failures
+    """
+    
+    # Heartbeat Mechanism
+    def heartbeat_detection(self):
+        """
+        Nodes enviam heartbeats periódicos
+        """
+        class Node:
+            def __init__(self, node_id):
+                self.node_id = node_id
+                self.last_heartbeat = time.time()
+            
+            def send_heartbeat(self):
+                """Node envia heartbeat a cada segundo"""
+                self.last_heartbeat = time.time()
+                broadcast_to_cluster({
+                    'node_id': self.node_id,
+                    'status': 'alive',
+                    'timestamp': self.last_heartbeat
+                })
+            
+            def is_alive(self, timeout=10):
+                """Considera node morto se sem heartbeat por 10s"""
+                return (time.time() - self.last_heartbeat) < timeout
+        
+        # Cassandra Gossip Protocol:
+        # - Cada node fala com 1-3 outros nodes a cada segundo
+        # - Informação propaga exponencialmente
+        # - Toda a cluster sabe de um failure em ~log(N) heartbeats
+        # - Com 100 nodes: ~7 segundos para full propagation
+    
+    # Failure Handling: Hinted Handoff
+    def hinted_handoff(self):
+        """
+        Cassandra: Armazenar writes para nodes down temporariamente
+        """
+        def write_with_hinted_handoff(key, value, replicas):
+            hints = []
+            successful_writes = 0
+            
+            for replica in replicas:
+                if replica.is_alive():
+                    try:
+                        replica.write(key, value)
+                        successful_writes += 1
+                    except Exception:
+                        # Replica down, store hint
+                        hints.append({
+                            'target_replica': replica,
+                            'key': key,
+                            'value': value,
+                            'timestamp': time.time()
+                        })
+                else:
+                    # Replica known to be down, store hint
+                    hints.append({
+                        'target_replica': replica,
+                        'key': key,
+                        'value': value,
+                        'timestamp': time.time()
+                    })
+            
+            # Store hints para delivery posterior
+            for hint in hints:
+                hint_storage.store(hint)
+            
+            # Background process: Deliver hints quando replica voltar
+            def deliver_hints_periodically():
+                while True:
+                    pending_hints = hint_storage.get_all()
+                    for hint in pending_hints:
+                        if hint['target_replica'].is_alive():
+                            try:
+                                hint['target_replica'].write(
+                                    hint['key'],
+                                    hint['value']
+                                )
+                                hint_storage.delete(hint)  # Delivered!
+                            except Exception:
+                                pass  # Retry later
+                    time.sleep(60)  # Check every minute
+        
+        # Benefícios:
+        # - Zero writes lost durante temporary failures
+        # - Eventual consistency mantida
+        # - Availability não degradada
+        
+        # Limitações:
+        # - Hints armazenados por max 3 horas (default Cassandra)
+        # - Se node não voltar em 3h, hints descartados
+        # - Requer anti-entropy repair para recuperar
+    
+    # Read Repair
+    def read_repair(self):
+        """
+        Detectar e corrigir inconsistências durante reads
+        """
+        def read_with_repair(key, replicas):
+            # 1. Read de múltiplas replicas
+            responses = []
+            for replica in replicas[:3]:  # Read from 3 replicas
+                try:
+                    data = replica.read(key)
+                    responses.append((replica, data))
+                except Exception:
+                    pass  # Ignore failed replica
+            
+            # 2. Compare responses
+            if len(responses) < 2:
+                return responses[0][1] if responses else None
+            
+            # 3. Detect inconsistency
+            values = [r[1] for r in responses]
+            if not all_equal(values):
+                # Inconsistency detected!
+                # Choose most recent based on timestamp
+                latest = max(responses, key=lambda r: r[1]['timestamp'])
+                
+                # 4. Async repair: Update stale replicas
+                async def repair_stale_replicas():
+                    for replica, data in responses:
+                        if data != latest[1]:
+                            replica.write(key, latest[1])
+                            print(f"Repaired stale data on {replica}")
+                
+                asyncio.create_task(repair_stale_replicas())
+                
+                return latest[1]
+            
+            return responses[0][1]
+        
+        # Benefícios:
+        # - Self-healing: Inconsistências corrigidas automaticamente
+        # - No admin intervention: Totalmente automático
+        # - Eventual consistency: Converge com o tempo
+        
+        # Cassandra: Read repair probability configurável (default 10%)
+        # - Trade-off: 100% = consistência mais rápida mas mais overhead
+    
+    # Anti-Entropy Repair
+    def anti_entropy_repair(self):
+        """
+        Background process: Comparar e sincronizar todas as replicas
+        """
+        # Cassandra: nodetool repair
+        def full_repair():
+            """
+            Scheduled repair: Comparar Merkle trees
+            """
+            # 1. Cada replica constrói Merkle tree dos dados
+            #    - Tree hash: Eficiente comparar grandes datasets
+            #    - Detecta diferenças sem transferir todos os dados
+            
+            # 2. Replicas trocam Merkle trees
+            # 3. Identificam partitions com diferenças
+            # 4. Sincronizam apenas partitions diferentes
+            
+            # Scheduling:
+            # - Run semanalmente ou mensalmente
+            # - Off-peak hours (overhead significativo)
+            # - Required: Para evitar data loss de hints expiradas
+            
+            # Performance impact:
+            # - CPU: 10-30% durante repair
+            # - Network: Alta bandwidth para sync
+            # - Latency: +10-50ms para requests durante repair
+        
+        # DynamoDB: Automatic continuous repair
+        # - Background process sempre ativo
+        # - Compara replicas continuamente
+        # - Sem intervenção manual necessária
+
+#### Multi-Region Availability
+
+```python
+class MultiRegionAvailability:
+    """
+    Disponibilidade cross-region
+    """
+    
+    # DynamoDB Global Tables
+    def dynamodb_global_tables(self):
+        """
+        Multi-master replication cross-region
+        """
+        config = {
+            'regions': ['us-east-1', 'eu-west-1', 'ap-southeast-1'],
+            'replication': 'Bi-directional multi-master',
+            'consistency': 'Eventual (typically <1 second)',
+            
+            'availability': {
+                'regional_failure': 'Traffic routes to other regions',
+                'rto': 'Seconds to minutes',  # Failover time
+                'rpo': '<1 second',  # Data loss potential
+                'sla': '99.999% (5 noves)'
+            },
+            
+            'conflict_resolution': {
+                'strategy': 'Last Writer Wins (LWW)',
+                'based_on': 'Timestamp comparison',
+                'alternative': 'Custom Lambda resolver'
+            }
+        }
+        
+        # Scenario: us-east-1 region failure
+        # 1. Health checks detect region down
+        # 2. Route 53 routes traffic to eu-west-1 e ap-southeast-1
+        # 3. Users experience: 2-5 min downtime (DNS propagation)
+        # 4. Data: Zero loss (replicated < 1s before failure)
+        # 5. After recovery: us-east-1 auto-syncs com outras regiões
+        
+        # Write conflicts:
+        # T0: US user writes {name: 'John Smith'}
+        # T0: EU user writes {name: 'John Doe'} (same item, concurrent)
+        # 
+        # Resolution:
+        # - Compare timestamps
+        # - Most recent write wins
+        # - Both regions converge to winner
+        # - Loser's write is lost (acceptable para maioria dos casos)
+        
+        return config
+    
+    # Cassandra Multi-DC
+    def cassandra_multi_dc(self):
+        """
+        Cassandra: Multi-datacenter deployment
+        """
+        # Setup: 3 datacenters
+        # - DC1: us-east (3 nodes, RF=3)
+        # - DC2: eu-west (3 nodes, RF=3)
+        # - DC3: ap-south (3 nodes, RF=3)
+        
+        # Write path com LOCAL_QUORUM:
+        def write_local_quorum(key, value):
+            # Client writes to local DC (ex: us-east)
+            # 1. Coordinator node em us-east
+            # 2. Write para LOCAL replicas (3 nodes em us-east)
+            # 3. Aguarda LOCAL_QUORUM (2 de 3 em us-east)
+            # 4. Returns success (10-20ms)
+            
+            # Background: Async replication para outros DCs
+            # 5. us-east → eu-west (100ms)
+            # 6. us-east → ap-south (200ms)
+            # 
+            # Cross-DC replication: Eventual
+            
+            return "Write committed locally"
+        
+        # Read path com LOCAL_QUORUM:
+        def read_local_quorum(key):
+            # Read from local DC apenas
+            # Fast: 10-20ms
+            # Consistency: LOCAL strong, GLOBAL eventual
+            
+            return local_dc.read(key, CL='LOCAL_QUORUM')
+        
+        # DC failure scenario:
+        # - us-east DC completamente down
+        # - Clients automaticamente failover para eu-west
+        # - Zero data loss (multi-DC replication)
+        # - Performance: Slightly higher latency (cross-region)
+        # - Capacity: 66% (2 de 3 DCs remaining)
+        
+        # Benefits:
+        # - Disaster recovery: DC failure tolerado
+        # - Geo-distribution: Low latency global
+        # - Compliance: Data residency reqs
+        
+        # Trade-offs:
+        # - 3x cost (3 full replicas)
+        # - Complexity: Config e monitoring
+        # - Consistency: Cross-DC eventual
+
+#### Backup and Recovery
+
+```python
+class BackupRecovery:
+    """
+    Estratégias de backup para disaster recovery
+    """
+    
+    # DynamoDB Point-in-Time Recovery (PITR)
+    def dynamodb_pitr(self):
+        """
+        Continuous backups com 35 dias de retention
+        """
+        # Enable PITR:
+        dynamodb.update_continuous_backups(
+            TableName='Users',
+            PointInTimeRecoverySpecification={
+                'PointInTimeRecoveryEnabled': True
+            }
+        )
+        
+        # Cost: 20% do storage cost (exemplo: $0.20/GB-month)
+        
+        # Recovery scenarios:
+        scenarios = {
+            'Accidental delete': {
+                'problem': 'Desenvolvedor deletou 10K items por engano',
+                'solution': 'Restore table para 5 minutos antes',
+                'rto': '10-30 minutos',
+                'rpo': '1 segundo'
+            },
+            
+            'Data corruption': {
+                'problem': 'Bug alterou dados incorretamente',
+                'solution': 'Restore table para antes do deploy buggy',
+                'rto': '10-30 minutos',
+                'rpo': '1 segundo'
+            },
+            
+            'Compliance': {
+                'problem': 'Audit requer dados de 30 dias atrás',
+                'solution': 'Restore para timestamp específico',
+                'rto': 'Não crítico',
+                'rpo': 'Perfeito (point-in-time)'
+            }
+        }
+        
+        # Restore process:
+        dynamodb.restore_table_to_point_in_time(
+            SourceTableName='Users',
+            TargetTableName='Users-Restored-2024-01-15',
+            RestoreDateTime=datetime(2024, 1, 15, 10, 30, 0)
+        )
+        
+        # Notes:
+        # - Restore cria NOVA table (não sobrescreve original)
+        # - Aplicação deve apontar para nova table
+        # - Original table pode ser mantida para comparação
+        
+        return scenarios
+    
+    # On-Demand Backups
+    def on_demand_backups(self):
+        """
+        Snapshots manuais para long-term retention
+        """
+        # DynamoDB on-demand backup:
+        response = dynamodb.create_backup(
+            TableName='Users',
+            BackupName='users-backup-pre-migration-2024-01-15'
+        )
+        
+        # Properties:
+        # - Full snapshot: Toda a table em momento específico
+        # - Retention: Indefinido (até deletar manualmente)
+        # - Cost: $0.10/GB-month (metade do custo de PITR)
+        # - Recovery: Restore para new table
+        
+        # Use cases:
+        # - Before major migrations
+        # - Compliance (long-term retention)
+        # - Disaster recovery tests
+        
+        # Restore:
+        dynamodb.restore_table_from_backup(
+            TargetTableName='Users-Restored',
+            BackupArn=response['BackupDetails']['BackupArn']
+        )
+    
+    # Redis Persistence
+    def redis_persistence(self):
+        """
+        Redis: RDB snapshots + AOF log
+        """
+        # RDB (Redis Database Snapshot)
+        rdb_config = {
+            'save_intervals': [
+                '900 1',    # Save se ≥1 change em 900s
+                '300 10',   # Save se ≥10 changes em 300s
+                '60 10000'  # Save se ≥10K changes em 60s
+            ],
+            'file': 'dump.rdb',
+            'compression': 'yes',
+            
+            'pros': [
+                'Compact single file',
+                'Fast restart',
+                'Good for backups'
+            ],
+            'cons': [
+                'Potential data loss (between snapshots)',
+                'Fork() pode ser lento para large datasets',
+                'Not suitable for zero data loss'
+            ]
+        }
+        
+        # AOF (Append-Only File)
+        aof_config = {
+            'appendonly': 'yes',
+            'appendfsync': 'everysec',  # Fsync every second
+            # Alternatives: 'always' (slow), 'no' (fast, risky)
+            
+            'file': 'appendonly.aof',
+            'rewrite_threshold': '100%',  # Rewrite quando 2x tamanho
+            
+            'pros': [
+                'Better durability (max 1s data loss)',
+                'Append-only: Corruption resistant',
+                'Human-readable log'
+            ],
+            'cons': [
+                'Larger file size',
+                'Slower restart (replay log)',
+                'Slight performance overhead'
+            ]
+        }
+        
+        # Best practice: RDB + AOF
+        # - RDB para fast recovery
+        # - AOF para durability
+        # - Trade-off: 2x storage, melhor de ambos
+        
+        # ElastiCache for Redis (AWS):
+        elasticache_config = {
+            'daily_backups': 'Automatic RDB snapshots',
+            'retention': '1-35 days',
+            'manual_snapshots': 'Unlimited retention',
+            'restore': 'Create new cluster from snapshot',
+            
+            'multi_az': {
+                'enabled': True,
+                'automatic_failover': '< 1 minute',
+                'read_replica': 'Promoted to primary'
+            }
+        }
+
+#### Availability SLAs
+
+```python
+class AvailabilitySLAs:
+    """
+    Service Level Agreements e garantias de disponibilidade
+    """
+    
+    aws_nosql_slas = {
+        'DynamoDB': {
+            'single_region': {
+                'sla': '99.99%',  # 4 noves
+                'downtime_month': '4.38 minutos',
+                'architecture': '3 AZs, synchronous replication'
+            },
+            'global_tables': {
+                'sla': '99.999%',  # 5 noves
+                'downtime_month': '26.3 segundos',
+                'architecture': 'Multi-region, active-active'
+            }
+        },
+        
+        'ElastiCache': {
+            'single_node': {
+                'sla': 'None',  # Sem SLA!
+                'reason': 'Single point of failure'
+            },
+            'cluster_mode': {
+                'sla': '99.99%',
+                'downtime_month': '4.38 minutos',
+                'architecture': 'Multi-AZ, automatic failover'
+            }
+        },
+        
+        'DocumentDB': {
+            'sla': '99.99%',
+            'downtime_month': '4.38 minutos',
+            'architecture': '3 AZs, 6 replicas'
+        }
+    }
+    
+    # Calculating Composite Availability
+    def composite_availability(self):
+        """
+        Calcular availability de sistema composto
+        """
+        # Sistema: API Gateway → Lambda → DynamoDB
+        
+        component_availability = {
+            'api_gateway': 0.9999,  # 99.99%
+            'lambda': 0.9999,       # 99.99%
+            'dynamodb': 0.9999      # 99.99%
+        }
+        
+        # Serial components: Multiply
+        system_availability = (
+            component_availability['api_gateway'] *
+            component_availability['lambda'] *
+            component_availability['dynamodb']
+        )
+        # = 0.9997 = 99.97%
+        # Downtime: ~13 minutos/mês
+        
+        # Com fallback/redundancy:
+        # Primary: DynamoDB (99.99%)
+        # Fallback: Cache (99.9%)
+        # Combined = 1 - (1 - 0.9999) * (1 - 0.999)
+        #          = 1 - 0.0001 * 0.001
+        #          = 1 - 0.0000001
+        #          = 0.9999999 = 99.99999% (7 noves!)
+        
+        return system_availability
+
+### Advantages, Trade-offs, and Considerations (Vantagens, Trade-offs e Considerações)
+
+Key-Value databases oferecem vantagens significativas mas também vêm com trade-offs que devem ser cuidadosamente considerados no design de sistemas.
+
+#### Vantagens dos Key-Value Stores
+
+```python
+class KeyValueAdvantages:
+    """
+    Principais vantagens dos Key-Value databases
+    """
+    
+    # 1. Performance Excepcional
+    def performance_advantage(self):
+        """
+        Latência ultra-baixa e high throughput
+        """
+        performance_comparison = {
+            'Operation': 'GET by Primary Key',
+            
+            'Redis (in-memory)': {
+                'latency_p50': '0.1-0.3ms',
+                'latency_p99': '0.5-1ms',
+                'throughput': '100,000+ ops/s per node'
+            },
+            
+            'DynamoDB (SSD)': {
+                'latency_p50': '2-5ms',
+                'latency_p99': '10-20ms',
+                'throughput': '1,000,000+ ops/s per table'
+            },
+            
+            'PostgreSQL (relational)': {
+                'latency_p50': '5-15ms',
+                'latency_p99': '50-200ms',
+                'throughput': '10,000-50,000 ops/s per instance',
+                'note': 'Com índice otimizado, sem JOINs'
+            }
+        }
+        
+        # Por que tão rápido?
+        reasons = {
+            'Simple data model': 'Sem JOINs, sem query planning',
+            'O(1) lookup': 'Hash table direto',
+            'No schema validation': 'Valor opaco, sem parsing',
+            'Optimized storage': 'LSM trees (writes), B-trees (reads)',
+            'In-memory option': 'Redis mantém tudo em RAM'
+        }
+        
+        # Use case: Real-time bidding
+        real_time_bidding = """
+        Ad Exchange: 100ms total para:
+        1. Receber bid request
+        2. Lookup user profile (DynamoDB: 2-5ms) ✓
+        3. Check targeting rules
+        4. Calculate bid price  
+        5. Return bid response
+        
+        Com SQL: 20-50ms só para lookup → Não atende SLA
+        Com Key-Value: 2-5ms → Sobra tempo para lógica
+        """
+        
+        return performance_comparison, reasons, real_time_bidding
+    
+    # 2. Escalabilidade Linear
+    def scalability_advantage(self):
+        """
+        Add nodes = Add capacity (quase linear)
+        """
+        scalability_example = {
+            'Initial setup': {
+                'nodes': 3,
+                'throughput': '30K ops/s',
+                'capacity': '300GB',
+                'cost': '$300/month'
+            },
+            
+            'After doubling nodes': {
+                'nodes': 6,
+                'throughput': '58K ops/s',  # ~2x
+                'capacity': '600GB',        # 2x
+                'cost': '$600/month',       # 2x
+                'efficiency': '97%'         # Quase linear!
+            },
+            
+            'Comparison with relational': {
+                'vertical_scaling': 'Limit físico (máquina maior)',
+                'sharding_manual': 'Complexo, requer rewrite application',
+                'efficiency': '50-70% (overhead de coordenação)'
+            }
+        }
+        
+        # Por que escalabilidade tão boa?
+        reasons = [
+            'Particionamento natural por key',
+            'Sem coordenação cross-partition',
+            'Stateless request routing',
+            'Consistent hashing (minimal rebalancing)'
+        ]
+        
+        return scalability_example, reasons
+    
+    # 3. Alta Disponibilidade
+    def availability_advantage(self):
+        """
+        Built-in replication e failover
+        """
+        availability_features = {
+            'DynamoDB': {
+                'replication': '3 AZs automático',
+                'failover': 'Transparente (segundos)',
+                'sla': '99.99% (single-region), 99.999% (global)',
+                'manual_intervention': 'Zero'
+            },
+            
+            'Cassandra': {
+                'replication': 'RF configurável (tipicamente 3)',
+                'failover': 'Automático via gossip protocol',
+                'sla': 'Depende de configuração',
+                'tunable_consistency': 'ONE, QUORUM, ALL'
+            },
+            
+            'Comparison': {
+                'Traditional DB': {
+                    'replication': 'Manual setup, master-slave',
+                    'failover': '30-300 segundos, pode precisar intervenção',
+                    'sla': '99.9-99.95% típico',
+                    'manual_intervention': 'Frequentemente necessário'
+                }
+            }
+        }
+        
+        # Zero-downtime operations:
+        zero_downtime_ops = [
+            'Add/remove nodes: Rolling, sem downtime',
+            'Schema changes: Não necessário (schema-less)',
+            'Backups: Online, sem impacto',
+            'Upgrades: Rolling upgrades',
+            'Disaster recovery: Multi-region automático'
+        ]
+        
+        return availability_features, zero_downtime_ops
+    
+    # 4. Simplicidade Operacional
+    def operational_simplicity(self):
+        """
+        Menor overhead operacional
+        """
+        comparison = {
+            'Setup Complexity': {
+                'Key-Value (DynamoDB)': {
+                    'setup_time': '5 minutos (CreateTable API)',
+                    'expertise_required': 'Básico AWS',
+                    'infra_management': 'Zero (fully managed)'
+                },
+                'Key-Value (Redis)': {
+                    'setup_time': '15-30 minutos',
+                    'expertise_required': 'Intermediate',
+                    'infra_management': 'Medium (ElastiCache) to High (self-managed)'
+                },
+                'Relational (PostgreSQL RDS)': {
+                    'setup_time': '30-60 minutos',
+                    'expertise_required': 'Intermediate to Advanced',
+                    'infra_management': 'Medium (parameter tuning, vacuuming)'
+                }
+            },
+            
+            'Day-to-day Operations': {
+                'Key-Value': [
+                    'No vacuuming/reindexing',
+                    'No query optimization',
+                    'No schema migrations',
+                    'Auto-scaling available',
+                    'Monitoring: Simples métricas (throughput, latency)'
+                ],
+                'Relational': [
+                    'Regular vacuuming (PostgreSQL)',
+                    'Query plan analysis',
+                    'Schema migration planning',
+                    'Manual scaling coordination',
+                    'Monitoring: Complexo (locks, deadlocks, slow queries)'
+                ]
+            }
+        }
+        
+        return comparison
+    
+    # 5. Cost-Effectiveness (Para casos de uso apropriados)
+    def cost_advantage(self):
+        """
+        Custo-benefício para workloads apropriados
+        """
+        # Session store example: 1M active sessions
+        session_store_costs = {
+            'DynamoDB': {
+                'storage': '1M sessions × 2KB = 2GB × $0.25/GB = $0.50',
+                'throughput': '1000 RCU + 200 WCU = $250',
+                'total_monthly': '$250.50',
+                'notes': 'On-demand seria ~$300'
+            },
+            
+            'Redis (ElastiCache)': {
+                'instances': '1× cache.r6g.large = $150',
+                'data_transfer': '$20',
+                'total_monthly': '$170',
+                'notes': 'Mais barato mas volatile (sem persistence)'
+            },
+            
+            'PostgreSQL (RDS)': {
+                'instance': '1× db.r6g.large = $300',
+                'storage': '10GB × $0.115 = $1.15',
+                'iops': '$100 (provisioned)',
+                'total_monthly': '$401',
+                'notes': 'Overkill para session store, performance inferior'
+            }
+        }
+        
+        # Key insight:
+        key_insight = """
+        Key-Value é cost-effective quando:
+        1. Access pattern é simples (GET/PUT by key)
+        2. Alto volume de requests
+        3. Não precisa de queries complexas
+        4. Schema flexível/evolutivo
+        
+        Relational é melhor quando:
+        1. Queries complexas com JOINs
+        2. Transactions multi-table
+        3. Strong consistency critical
+        4. Ad-hoc analytics
+        """
+        
+        return session_store_costs, key_insight
+
+#### Trade-offs e Limitações
+
+```python
+class KeyValueTradeoffs:
+    """
+    Limitações e trade-offs a considerar
+    """
+    
+    # 1. Queries Limitadas
+    def limited_queries(self):
+        """
+        Apenas queries por primary key (sem rich queries)
+        """
+        limitations = {
+            'No support for': [
+                'JOINs entre tables',
+                'Aggregations (SUM, AVG, GROUP BY)',
+                'Full-text search',
+                'Complex filters (múltiplos atributos)',
+                'Sorting por atributos não-key'
+            ],
+            
+            'Workarounds': {
+                'Secondary Indexes': {
+                    'solution': 'DynamoDB GSI/LSI, maintain manual indexes',
+                    'trade_off': 'Eventual consistency, custo extra, complexity'
+                },
+                'Denormalization': {
+                    'solution': 'Duplicate data, embed related entities',
+                    'trade_off': 'Storage overhead, potential inconsistency'
+                },
+                'Application-level JOINs': {
+                    'solution': 'Fetch múltiplos items, join in code',
+                    'trade_off': 'N+1 queries, higher latency'
+                },
+                'Specialized indexes': {
+                    'solution': 'Elasticsearch para search, data warehouse para analytics',
+                    'trade_off': 'Multiple databases, sync overhead'
+                }
+            }
+        }
+        
+        # Example: E-commerce query impossível em Key-Value:
+        impossible_query = """
+        SQL (fácil):
+        SELECT p.name, p.price, c.name as category, AVG(r.rating)
+        FROM products p
+        JOIN categories c ON p.category_id = c.id
+        JOIN reviews r ON p.id = r.product_id
+        WHERE p.price < 100
+          AND c.name = 'Electronics'
+          AND r.rating >= 4
+        GROUP BY p.id
+        HAVING COUNT(r.id) >= 10
+        ORDER BY AVG(r.rating) DESC
+        LIMIT 10
+        
+        Key-Value: Impossível nativamente!
+        Requer:
+        1. Denormalização massiva
+        2. Múltiplos índices secundários
+        3. Application logic para aggregation
+        4. Ou usar banco secundário (Elasticsearch)
+        """
+        
+        return limitations, impossible_query
+    
+    # 2. Eventual Consistency Challenges
+    def eventual_consistency_challenges(self):
+        """
+        Consistency model pode causar problemas
+        """
+        problems = {
+            'Read-your-writes': {
+                'problem': 'User faz write, immediately read vê valor antigo',
+                'example': """
+                # User atualiza foto de perfil
+                dynamodb.put_item(Item={'user_id': '123', 'photo': 'new.jpg'})
+                
+                # Immediately lê (pode ser de replica stale)
+                user = dynamodb.get_item(Key={'user_id': '123'})
+                photo = user['photo']  # Pode ser 'old.jpg'! ❌
+                """,
+                'solutions': [
+                    'Strong consistency reads (2x latência)',
+                    'Session affinity (sticky sessions)',
+                    'Optimistic UI (update client-side immediately)'
+                ]
+            },
+            
+            'Causality violations': {
+                'problem': 'Events aparecem fora de ordem',
+                'example': """
+                # Thread 1: Create order
+                orders.put(order_id='001', status='created')
+                
+                # Thread 2: Update order (happens-after)
+                orders.put(order_id='001', status='paid')
+                
+                # Thread 3: Read order (pode ver 'created' após 'paid'!)
+                order = orders.get(order_id='001')
+                # Due to replication lag, pode ver status='created'
+                # Mesmo que 'paid' já foi escrito!
+                """,
+                'solutions': [
+                    'Version vectors',
+                    'Logical clocks (Lamport timestamps)',
+                    'Strong consistency para critical operations'
+                ]
+            },
+            
+            'Lost updates': {
+                'problem': 'Concurrent writes podem se sobrescrever',
+                'example': """
+                # User A e User B editam perfil simultaneamente
+                # A: Read profile → Edit name → Write
+                # B: Read profile → Edit email → Write
+                # Result: B's write sobrescreve name edit de A ❌
+                """,
+                'solutions': [
+                    'Conditional writes (optimistic locking)',
+                    'Atomic operations (UPDATE SET específico)',
+                    'Version numbers ou timestamps'
+                ]
+            }
+        }
+        
+        # When eventual consistency is acceptable:
+        acceptable_use_cases = [
+            'Social media feeds (lag de segundos OK)',
+            'View counts, likes (approximate values)',
+            'Product recommendations (staleness não crítica)',
+            'Logging, metrics (aggregate data)',
+            'Content delivery (CDN caching)'
+        ]
+        
+        # When strong consistency is required:
+        required_use_cases = [
+            'Financial transactions',
+            'Inventory management',
+            'User authentication',
+            'Order processing',
+            'Healthcare records'
+        ]
+        
+        return problems, acceptable_use_cases, required_use_cases
+    
+    # 3. Storage Limitations
+    def storage_limitations(self):
+        """
+        Limitações de tamanho e estrutura
+        """
+        limitations = {
+            'DynamoDB': {
+                'item_size_max': '400 KB',
+                'partition_key_max': '2048 bytes',
+                'sort_key_max': '1024 bytes',
+                'attribute_name_max': '255 bytes',
+                
+                'workarounds': {
+                    'Large items': 'Store em S3, reference em DynamoDB',
+                    'Large attributes': 'Compress, or split into múltiplos items'
+                }
+            },
+            
+            'Redis': {
+                'key_size_max': '512 MB',
+                'value_size_max': '512 MB',
+                'memory_limit': 'RAM size (sem overflow to disk)',
+                'collection_size_max': '2^32-1 elements',
+                
+                'practical_limits': {
+                    'recommended_value_size': '< 10 MB',
+                    'recommended_collection_size': '< 1M elements',
+                    'reason': 'Performance degradation, memory fragmentation'
+                }
+            },
+            
+            'Cassandra': {
+                'partition_size_recommended': '< 100 MB',
+                'partition_size_max': '2 GB (warning threshold)',
+                'row_size_max': '2 GB',
+                
+                'problems_with_large_partitions': [
+                    'Read latency degradation',
+                    'Compaction overhead',
+                    'Tombstone accumulation',
+                    'Memory pressure'
+                ]
+            }
+        }
+        
+        # Example problema: Storing chat history
+        chat_history_problem = """
+        Bad design:
+        partition_key = conversation_id
+        clustering_key = timestamp
+        
+        Problem: Popular conversation com 1M mensagens
+        - Partition size: 1M × 2KB = 2GB (TOO BIG!)
+        - Read entire conversation: Timeout
+        - Compaction: Hours, high CPU
+        
+        Better design:
+        partition_key = (conversation_id, bucket)
+        bucket = year_month (ex: '2024-01')
+        clustering_key = timestamp
+        
+        Benefit: Cada partition ~30K mensagens = 60MB ✓
+        Trade-off: Query cross-buckets requer multiple reads
+        """
+        
+        return limitations, chat_history_problem
+    
+    # 4. Operational Complexity (Para self-managed)
+    def operational_complexity(self):
+        """
+        Complexidade operacional para soluções self-managed
+        """
+        # Cassandra operational burden:
+        cassandra_ops = {
+            'Daily tasks': [
+                'Monitor compaction queues',
+                'Check tombstone ratios',
+                'Review GC pause times',
+                'Monitor disk utilization'
+            ],
+            
+            'Weekly tasks': [
+                'Analyze slow queries',
+                'Review partition sizes',
+                'Check repair status',
+                'Capacity planning'
+            ],
+            
+            'Monthly tasks': [
+                'Full cluster repair (anti-entropy)',
+                'Rolling restarts para patches',
+                'Performance tuning',
+                'Backup validation'
+            ],
+            
+            'Expertise required': [
+                'JVM tuning (heap, GC)',
+                'Network configuration (gossip, timeouts)',
+                'Data modeling best practices',
+                'Troubleshooting distributed systems',
+                'Understanding consistency levels'
+            ],
+            
+            'Team size': '1-2 dedicated DBAs para cluster production'
+        }
+        
+        # Managed services advantage:
+        managed_comparison = {
+            'DynamoDB (fully managed)': {
+                'operational_burden': 'Minimal',
+                'expertise_required': 'Basic AWS knowledge',
+                'team_size': '0 dedicated DBAs',
+                'cost_premium': '20-40% mais caro que self-managed',
+                'trade_off': 'Worth it para maioria dos casos'
+            },
+            
+            'ElastiCache (managed Redis)': {
+                'operational_burden': 'Low',
+                'expertise_required': 'Intermediate Redis knowledge',
+                'team_size': '0.5 DBA (part-time)',
+                'cost_premium': '30-50%',
+                'benefits': 'Auto-failover, backups, patching automático'
+            }
+        }
+        
+        return cassandra_ops, managed_comparison
+    
+    # 5. Cost at Scale
+    def cost_at_scale(self):
+        """
+        Custos podem escalar rapidamente
+        """
+        cost_examples = {
+            'DynamoDB - High throughput case': {
+                'workload': '100K reads/s + 20K writes/s',
+                'requirements': '50K RCU + 20K WCU',
+                'provisioned_cost': '$28,800/month',
+                'on_demand_cost': '$50,000+/month',
+                
+                'optimization_strategies': [
+                    'Caching (Redis): Reduz para 10K RCU = $5,000 savings',
+                    'Compression: Reduz item sizes = 30% savings',
+                    'Batch operations: Reduce WCU consumption',
+                    'DynamoDB Accelerator (DAX): $3,000/m mas evita $20K em RCU'
+                ]
+            },
+            
+            'Storage costs': {
+                'DynamoDB': {
+                    'rate': '$0.25/GB-month',
+                    '1TB example': '$250/month',
+                    'note': 'Competitive para data frequentemente acessado'
+                },
+                'S3': {
+                    'rate': '$0.023/GB-month',
+                    '1TB example': '$23/month',
+                    'note': 'Muito mais barato, mas não queryable'
+                },
+                'EBS (PostgreSQL)': {
+                    'rate': '$0.10/GB-month',
+                    '1TB example': '$100/month',
+                    'note': 'Mais barato mas I/O costs extras'
+                }
+            },
+            
+            'Hidden costs': [
+                'Data transfer: Significativo para multi-region',
+                'Backups: 20% adicional para PITR',
+                'Global tables: 3x replication cost',
+                'GSI: Cada índice = custo extra de storage + throughput'
+            ]
+        }
+        
+        # When Key-Value becomes expensive:
+        expensive_scenarios = [
+            'High write throughput com large items',
+            'Multiple GSIs (each costs like main table)',
+            'Global tables com heavy writes',
+            'On-demand pricing com steady high load',
+            'Storage-heavy com infrequent access'
+        ]
+        
+        # Cost optimization tips:
+        optimization_tips = [
+            'Use caching layer (Redis) para hot data',
+            'Compress large attributes',
+            'Archive cold data para S3',
+            'Right-size provisioned capacity',
+            'Delete unused GSIs',
+            'Use DynamoDB Streams judiciosamente',
+            'Consider reserved capacity para steady workloads'
+        ]
+        
+        return cost_examples, expensive_scenarios, optimization_tips
+
+#### Quando Usar Key-Value Stores
+
+```python
+class WhenToUseKeyValue:
+    """
+    Decision matrix para escolher Key-Value database
+    """
+    
+    ideal_use_cases = {
+        'Session Management': {
+            'why_key_value': [
+                'Simple GET/SET por session ID',
+                'High throughput (todos requests)',
+                'TTL automático (session expiry)',
+                'Low latency requirement (<10ms)'
+            ],
+            'recommended': 'Redis ou DynamoDB',
+            'anti_pattern': None
+        },
+        
+        'Caching Layer': {
+            'why_key_value': [
+                'Ultra-low latency (<1ms)',
+                'High read throughput',
+                'TTL para cache invalidation',
+                'Simple key-based access'
+            ],
+            'recommended': 'Redis (ElastiCache)',
+            'anti_pattern': 'Não usar para source of truth'
+        },
+        
+        'User Profiles': {
+            'why_key_value': [
+                'Single-item access por user ID',
+                'Flexible schema (different users, different attributes)',
+                'High availability requirement',
+                'Global distribution (multi-region)'
+            ],
+            'recommended': 'DynamoDB Global Tables',
+            'anti_pattern': 'Se precisar queries complexas cross-user'
+        },
+        
+        'Shopping Carts': {
+            'why_key_value': [
+                'Temporary data (pode perder sem disaster)',
+                'High availability > consistency',
+                'Simple add/remove operations',
+                'Per-user isolation'
+            ],
+            'recommended': 'DynamoDB ou Redis',
+            'anti_pattern': None
+        },
+        
+        'Real-time Analytics': {
+            'why_key_value': [
+                'Atomic counters (page views, clicks)',
+                'High write throughput',
+                'Low latency increments',
+                'Approximate values acceptable'
+            ],
+            'recommended': 'Redis (Counters, HyperLogLog)',
+            'anti_pattern': 'Para analytics históricos, usar warehouse'
+        },
+        
+        'IoT Data Ingestion': {
+            'why_key_value': [
+                'High write throughput (milhões/s)',
+                'Time-series data',
+                'Device-based partitioning',
+                'Simple append operations'
+            ],
+            'recommended': 'DynamoDB ou Cassandra',
+            'anti_pattern': 'Para queries analíticas, sync para warehouse'
+        }
+    }
+    
+    not_recommended_use_cases = {
+        'Reporting/Analytics': {
+            'why_not': 'No aggregations, no complex queries',
+            'use_instead': 'Redshift, BigQuery, or sync data para warehouse'
+        },
+        
+        'Content Management com Rich Search': {
+            'why_not': 'No full-text search, no complex filters',
+            'use_instead': 'Elasticsearch, or DynamoDB + Elasticsearch'
+        },
+        
+        'Multi-entity Transactions': {
+            'why_not': 'Limited transactions, no cross-table JOINs',
+            'use_instead': 'PostgreSQL, or DynamoDB transactions (limited)'
+        },
+        
+        'Graph Relationships': {
+            'why_not': 'No efficient graph traversals',
+            'use_instead': 'Neptune (graph database)'
+        },
+        
+        'Ad-hoc Queries': {
+            'why_not': 'Queries devem ser predefined no design',
+            'use_instead': 'SQL database, or denormalize para cada query pattern'
+        }
+    }
+    
+    # Decision tree
+    def decision_tree(self, requirements):
+        """
+        Decision tree para escolher database type
+        """
+        # Q1: Access pattern
+        if requirements['access_pattern'] == 'complex_queries':
+            return 'SQL Database'
+        
+        # Q2: Consistency requirements
+        if requirements['consistency'] == 'strong_always':
+            if requirements['scale'] == 'moderate':
+                return 'SQL Database'
+            else:
+                return 'DynamoDB (strong consistency mode)'
+        
+        # Q3: Latency requirements
+        if requirements['latency'] == 'submillisecond':
+            return 'Redis (in-memory)'
+        elif requirements['latency'] == 'single_digit_ms':
+            return 'DynamoDB'
+        
+        # Q4: Data model
+        if requirements['data_model'] == 'simple_key_value':
+            return 'Redis or DynamoDB'
+        elif requirements['data_model'] == 'documents_with_nesting':
+            return 'DocumentDB or DynamoDB'
+        elif requirements['data_model'] == 'time_series':
+            return 'Cassandra or Timestream'
+        elif requirements['data_model'] == 'graph':
+            return 'Neptune'
+        
+        return 'Evaluate multiple options'
+```
+
+### Dynamo: Key-Value Database
+
+Amazon Dynamo, descrito no paper seminal de DeCandia et al. (2007), é o sistema que inspirou toda uma geração de Key-Value databases incluindo DynamoDB, Cassandra, Riak, e Voldemort. Entender Dynamo é fundamental para compreender o design de Key-Value stores modernos.
+
+#### História e Contexto
+
+```python
+class DynamoHistory:
+    """
+    História e contexto do Amazon Dynamo
+    """
+    
+    problem_statement = {
+        'year': 2004,
+        'context': 'Amazon.com crescimento exponencial',
+        'challenges': [
+            'Relational databases não escalavam para demanda',
+            'Downtime custava milhões de dólares',
+            'Black Friday failures eram inaceitáveis',
+            'Availability > Consistency para e-commerce'
+        ],
+        
+        'requirements': {
+            'availability': '99.99% (4 noves) mínimo',
+            'latency': '<300ms P99.9',
+            'scalability': 'Linear, adicionar nodes facilmente',
+            'simplicity': 'Simple data model, sem queries complexas',
+            'durability': 'Zero data loss'
+        },
+        
+        'key_insight': """
+        Para shopping cart e session data:
+        - Availability é mais crítica que consistency
+        - Better to show stale cart than no cart
+        - Better to allow duplicate items than block checkout
+        - Strong consistency não necessária para maioria das operations
+        """
+    }
+    
+    design_principles = {
+        'Sacrifice strong consistency': {
+            'reason': 'CAP theorem - choose Availability + Partition tolerance',
+            'strategy': 'Eventual consistency com conflict resolution'
+        },
+        
+        'Always writable': {
+            'reason': 'Never reject writes due to failures',
+            'strategy': 'Accept writes mesmo com nodes down (hinted handoff)'
+        },
+        
+        'Incremental scalability': {
+            'reason': 'Add/remove one node at a time sem disruption',
+            'strategy': 'Consistent hashing'
+        },
+        
+        'Decentralization': {
+            'reason': 'No single point of failure',
+            'strategy': 'Peer-to-peer architecture, all nodes equal'
+        },
+        
+        'Heterogeneity': {
+            'reason': 'Different nodes may have different capacities',
+            'strategy': 'Virtual nodes (vnodes) para load balancing'
+        }
+    }
+
+#### Arquitetura Técnica do Dynamo
+
+```python
+class DynamoArchitecture:
+    """
+    Componentes principais da arquitetura Dynamo
+    """
+    
+    # 1. Consistent Hashing com Virtual Nodes
+    def consistent_hashing_with_vnodes(self):
+        """
+        Particionamento e rebalanceamento eficiente
+        """
+        architecture = {
+            'Hash Ring': {
+                'concept': 'Círculo lógico de 0 a 2^128-1',
+                'node_placement': 'Cada node tem múltiplas positions (vnodes)',
+                'key_placement': 'MD5(key) determina position no ring',
+                'ownership': 'Node responsável: primeira position ≥ key hash'
+            },
+            
+            'Virtual Nodes': {
+                'count_per_node': '100-256 vnodes',
+                'benefit': 'Load balancing fino-grained',
+                'add_node': 'Recebe vnodes distribuídos uniformemente',
+                'remove_node': 'Seus vnodes redistribuídos uniformemente',
+                'heterogeneity': 'Nodes maiores = mais vnodes'
+            },
+            
+            'Example': """
+            Cluster: 4 nodes (A, B, C, D)
+            Each: 256 vnodes
+            Total: 1024 positions no ring
+            
+            Key 'user:1000' → MD5 → hash=12345678
+            Find: Primeira vnode position ≥ 12345678
+            Suppose: vnode-542 (pertence ao node B)
+            Write to: Node B (+ replicas)
+            """
+        }
+        
+        return architecture
+    
+    # 2. Replication
+    def replication_strategy(self):
+        """
+        Como Dynamo replica dados
+        """
+        strategy = {
+            'Replication Factor (N)': {
+                'typical_value': 3,
+                'meaning': 'Cada key replicada em N nodes',
+                'selection': 'N successor nodes clockwise no ring'
+            },
+            
+            'Coordinator': {
+                'role': 'Node que recebe request torna-se coordinator',
+                'responsibilities': [
+                    'Determina N nodes responsáveis pela key',
+                    'Envia writes para N nodes',
+                    'Aguarda responses baseado em W',
+                    'Retorna success ao client'
+                ]
+            },
+            
+            'Quorum-based Replication': {
+                'N': 'Replication factor (total replicas)',
+                'R': 'Read quorum (# nodes para read)',
+                'W': 'Write quorum (# nodes para write)',
+                'rule': 'R + W > N garante consistency',
+                
+                'typical_config': {
+                    'N': 3,
+                    'R': 2,
+                    'W': 2,
+                    'guarantee': 'Read sempre vê última write (R+W=4 > N=3)'
+                },
+                
+                'high_availability_config': {
+                    'N': 3,
+                    'R': 1,
+                    'W': 1,
+                    'trade_off': 'Máxima availability, eventual consistency'
+                }
+            }
+        }
+        
+        return strategy
+    
+    # 3. Versioning e Conflict Resolution
+    def versioning_and_conflicts(self):
+        """
+        Como Dynamo trata updates conflitantes
+        """
+        versioning = {
+            'Vector Clocks': {
+                'purpose': 'Track causal relationships entre versions',
+                'structure': 'Lista de (node, counter) pairs',
+                
+                'example': """
+                Initial: [{A: 1}]           # Node A write version 1
+                Branch 1: [{A: 1}, {B: 1}]  # Node B concurrent write
+                Branch 2: [{A: 1}, {C: 1}]  # Node C concurrent write
+                
+                Conflict: Duas versions incomparáveis!
+                - Não há "latest" version clear
+                - Ambas são válidas (concurrent updates)
+                - Require reconciliation
+                """
+            },
+            
+            'Conflict Detection': {
+                'comparable': {
+                    'v1': [{A: 1}],
+                    'v2': [{A: 2}],
+                    'relationship': 'v2 descends from v1 (A: 2 > 1)',
+                    'action': 'Use v2, discard v1'
+                },
+                'concurrent': {
+                    'v1': [{A: 1}, {B: 1}],
+                    'v2': [{A: 1}, {C: 1}],
+                    'relationship': 'Neither descends from other',
+                    'action': 'Both kept, require reconciliation'
+                }
+            },
+            
+            'Conflict Resolution': {
+                'syntactic_reconciliation': {
+                    'strategy': 'Last-write-wins (timestamp)',
+                    'problem': 'Can lose data',
+                    'use_case': 'Quando perda de data é aceitável'
+                },
+                
+                'semantic_reconciliation': {
+                    'strategy': 'Application-specific merge logic',
+                    'example': """
+                    Shopping Cart Merge:
+                    Cart v1: [item A, item B]
+                    Cart v2: [item A, item C]
+                    Merged: [item A, item B, item C]  # Union
+                    
+                    Better: Allow duplicates, let user remove
+                    """,
+                    'use_case': 'Quando merge semântico faz sentido'
+                }
+            }
+        }
+        
+        return versioning
+    
+    # 4. Gossip Protocol
+    def failure_detection_gossip(self):
+        """
+        Membership e failure detection via gossip
+        """
+        gossip = {
+            'Protocol': {
+                'frequency': 'Cada node gossips a cada 1 segundo',
+                'target': 'Random 1-3 nodes',
+                'payload': 'Node ID, timestamp, token ranges owned'
+            },
+            
+            'Failure Detection': {
+                'mechanism': 'No heartbeat em T segundos → suspect',
+                'T_typical': '10-30 segundos',
+                'propagation': 'Exponential (log N hops para full cluster)',
+                
+                'example': """
+                Cluster: 100 nodes
+                Node A fails
+                
+                t=0s: A stops sending heartbeats
+                t=10s: 3 nodes detect A down
+                t=11s: 3×3 = 9 nodes know A down
+                t=12s: 9×3 = 27 nodes know
+                t=13s: 27×3 = 81 nodes know
+                t=14s: 100 nodes know A down
+                
+                Total: ~14 segundos para full propagation
+                """
+            },
+            
+            'Permanent vs Temporary Failure': {
+                'temporary': 'Node down <T hours → hinted handoff',
+                'permanent': 'Node down >T hours → replica transfer',
+                'T_cassandra': '3 hours default'
+            }
+        }
+        
+        return gossip
+    
+    # 5. Hinted Handoff
+    def hinted_handoff_mechanism(self):
+        """
+        Garantir writes durante temporary failures
+        """
+        mechanism = {
+            'Normal Write': """
+            Key hash → Nodes [A, B, C]
+            All healthy: Write to A, B, C
+            """,
+            
+            'Node Down Scenario': """
+            Key hash → Nodes [A, B, C]
+            B is down
+            
+            Coordinator writes to:
+            - A: Normal write
+            - D: Hinted handoff (temporary holder)
+            - C: Normal write
+            
+            D stores hint: "This data belongs to B"
+            """,
+            
+            'Hint Delivery': """
+            B comes back online
+            D detects B is up (via gossip)
+            D transfers hints to B
+            D deletes local hints
+            
+            Result: B now has consistent data
+            """,
+            
+            'Benefits': [
+                'Zero write failures durante temporary outages',
+                'Eventual consistency maintained',
+                'No manual intervention required'
+            ],
+            
+            'Limitations': [
+                'Hints stored max T hours (3h default)',
+                'If B down > T, hints expire',
+                'Requires anti-entropy repair to recover'
+            ]
+        }
+        
+        return mechanism
+
+#### Influência e Legado
+
+```python
+class DynamoLegacy:
+    """
+    Como Dynamo influenciou databases modernos
+    """
+    
+    influenced_systems = {
+        'AWS DynamoDB (2012)': {
+            'adoption': 'Managed service inspirado em Dynamo paper',
+            'differences': [
+                'Fully managed (vs self-hosted)',
+                'Automatic partitioning',
+                'No vector clocks (simplified consistency)',
+                'Last-write-wins conflict resolution'
+            ],
+            'similarities': [
+                'Key-value model',
+                'Consistent hashing',
+                'Tunable consistency (eventual vs strong)',
+                'Multi-AZ replication'
+            ]
+        },
+        
+        'Apache Cassandra (2008)': {
+            'origin': 'Facebook, baseado em Dynamo + BigTable',
+            'dynamo_concepts': [
+                'Consistent hashing com vnodes',
+                'Gossip protocol',
+                'Hinted handoff',
+                'Tunable consistency (ONE, QUORUM, ALL)',
+                'Peer-to-peer architecture'
+            ],
+            'additions': [
+                'Column-family data model (de BigTable)',
+                'CQL query language',
+                'Secondary indexes',
+                'Materialized views'
+            ]
+        },
+        
+        'Riak (2009)': {
+            'adoption': 'Implementação quase-literal do Dynamo paper',
+            'additions': [
+                'Built-in conflict resolution (CRDTs)',
+                'Full-text search integration',
+                'MapReduce support'
+            ]
+        },
+        
+        'Voldemort (2009)': {
+            'origin': 'LinkedIn',
+            'use_case': 'Read-heavy, low-latency key-value',
+            'optimizations': [
+                'Client-side routing',
+                'Read-your-writes consistency',
+                'Pluggable storage engines'
+            ]
+        }
+    }
+    
+    key_innovations = {
+        'Consistent Hashing': {
+            'problem_solved': 'Minimal data movement durante scaling',
+            'adoption': 'Universal em distributed systems',
+            'used_by': ['CDNs', 'Load balancers', 'DHTs', 'Caches']
+        },
+        
+        'Vector Clocks': {
+            'problem_solved': 'Causality tracking sem coordenação',
+            'adoption': 'Distributedsystems, CRDTs',
+            'used_by': ['Riak', 'Akka', 'Orleans']
+        },
+        
+        'Quorum-based Replication': {
+            'problem_solved': 'Tunable consistency/availability',
+            'adoption': 'Most NoSQL databases',
+            'used_by': ['Cassandra', 'Riak', 'Cosmos DB']
+        },
+        
+        'Gossip Protocol': {
+            'problem_solved': 'Decentralized failure detection',
+            'adoption': 'Cluster management',
+            'used_by': ['Cassandra', 'Consul', 'Kubernetes']
+        },
+        
+        'Hinted Handoff': {
+            'problem_solved': 'Writes durante temporary failures',
+            'adoption': 'High-availability systems',
+            'used_by': ['Cassandra', 'Riak']
+        }
+    }
+    
+    lessons_learned = {
+        'CAP Theorem Practical': {
+            'lesson': 'Trade-offs são inevitáveis',
+            'insight': 'Choose availability + partition tolerance para e-commerce'
+        },
+        
+        'Simplicity Enables Scale': {
+            'lesson': 'Simple data model escala melhor',
+            'insight': 'GET/PUT by key → massive throughput'
+        },
+        
+        'Decentralization is Key': {
+            'lesson': 'Peer-to-peer > master-slave para availability',
+            'insight': 'No single point of failure'
+        },
+        
+        'Application-aware Conflict Resolution': {
+            'lesson': 'Sistema não pode resolver todos os conflitos',
+            'insight': 'Algumas decisões requerem semântica de aplicação'
+        }
+    }
+
+# Questões para Estudo sobre Dynamo
+class DynamoStudyQuestions:
+    """
+    Questões para aprofundar compreensão do Dynamo
+    """
+    
+    questions = [
+        {
+            'Q1': 'Por que Dynamo escolheu eventual consistency sobre strong consistency?',
+            'answer_key_points': [
+                'CAP theorem: Impossível ter C + A + P',
+                'Amazon priorizou Availability (vendas) sobre Consistency',
+                'Shopping cart: Melhor cart stale que indisponível',
+                'Conflicts resolváveis pela aplicação (merge carts)'
+            ]
+        },
+        
+        {
+            'Q2': 'Como vector clocks detectam conflitos?',
+            'answer_key_points': [
+                'Vector clock: Lista de (node, counter) tuples',
+                'v1 < v2: Todos counters v1 ≤ v2, pelo menos 1 menor',
+                'v1 || v2: Nem v1 < v2 nem v2 < v1 (concurrent!)',
+                'Conflitos: Versões concurrent requerem merge'
+            ]
+        },
+        
+        {
+            'Q3': 'Calcule garantia de consistency com N=3, R=2, W=2',
+            'answer_key_points': [
+                'R + W = 4 > N = 3',
+                'Read overlap: Pelo menos 1 node em R∩W',
+                'Garantia: Read sempre vê última write',
+                'Trade-off: Pode bloquear se 2 nodes down'
+            ]
+        },
+        
+        {
+            'Q4': 'Por que consistent hashing é superior a modulo hashing?',
+            'answer_key_points': [
+                'Modulo: hash(key) % N → Adicionar node move TODOS dados',
+                'Consistent: Apenas 1/N dos dados movem',
+                'Dynamo: Virtual nodes para balanceamento fino',
+                'Resultado: Scaling incremental sem downtime'
+            ]
+        }
+    ]
+
 ### 2. Document Stores
 
 **Conceito:**
