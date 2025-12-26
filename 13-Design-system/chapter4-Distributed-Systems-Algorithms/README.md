@@ -1524,3 +1524,967 @@ def demonstrate_phi_accrual():
 
 ---
 
+
+## 3. Eleição de Líder (Leader Election)
+
+### 3.1 O Problema da Eleição de Líder
+
+Muitos sistemas distribuídos requerem um coordenador ou líder para tarefas específicas. Eleição de líder é o processo de selecionar um único processo entre um conjunto de processos para atuar como líder.
+
+**Requisitos:**
+
+- **Safety**: No máximo um líder eleito por vez
+- **Liveness**: Eventualmente um líder é eleito (se houver processos corretos)
+- **Termination**: Algoritmo termina
+
+#### 3.1.1 Algoritmo Bully (Garcia-Molina)
+
+Algoritmo clássico onde processo com maior ID sempre vence.
+
+```python
+from enum import Enum
+import threading
+import time
+
+class ProcessState(Enum):
+    PARTICIPANT = 1
+    WAITING = 2
+    LEADER = 3
+
+class BullyElectionAlgorithm:
+    """
+    Implementação do Algoritmo Bully para eleição de líder
+    """
+    def __init__(self, process_id, all_processes):
+        self.process_id = process_id
+        self.all_processes = sorted(all_processes)  # IDs ordenados
+        self.state = ProcessState.PARTICIPANT
+        self.leader_id = None
+        self.election_in_progress = False
+        self.lock = threading.Lock()
+    
+    def start_election(self):
+        """
+        Inicia processo de eleição
+        """
+        with self.lock:
+            if self.election_in_progress:
+                return  # Eleição já em andamento
+            
+            self.election_in_progress = True
+            self.state = ProcessState.WAITING
+        
+        print(f"[P{self.process_id}] Starting election")
+        
+        # Envia ELECTION para todos processos com ID maior
+        higher_processes = [p for p in self.all_processes if p > self.process_id]
+        
+        if not higher_processes:
+            # Nenhum processo maior: Declara-se líder
+            self.become_leader()
+            return
+        
+        # Envia ELECTION messages
+        responses = []
+        for proc in higher_processes:
+            response = self.send_election_message(proc)
+            if response:
+                responses.append(response)
+        
+        if not responses:
+            # Nenhum processo maior respondeu: Torna-se líder
+            self.become_leader()
+        else:
+            # Alguém respondeu: Espera COORDINATOR message
+            threading.Timer(5.0, self.check_coordinator_timeout).start()
+    
+    def send_election_message(self, to_process):
+        """
+        Envia ELECTION message e espera OK
+        """
+        message = {
+            'type': 'ELECTION',
+            'from': self.process_id
+        }
+        
+        try:
+            response = self.send_with_timeout(message, to=to_process, timeout=1.0)
+            if response and response['type'] == 'OK':
+                print(f"[P{self.process_id}] Received OK from P{to_process}")
+                return response
+        except TimeoutError:
+            print(f"[P{self.process_id}] No response from P{to_process}")
+        
+        return None
+    
+    def handle_election_message(self, from_process):
+        """
+        Recebe ELECTION message de processo com ID menor
+        """
+        print(f"[P{self.process_id}] Received ELECTION from P{from_process}")
+        
+        # Responde OK
+        self.send_ok(from_process)
+        
+        # Inicia própria eleição
+        if not self.election_in_progress:
+            threading.Thread(target=self.start_election).start()
+    
+    def send_ok(self, to_process):
+        """
+        Envia OK message
+        """
+        message = {
+            'type': 'OK',
+            'from': self.process_id
+        }
+        self.send_async(message, to=to_process)
+    
+    def become_leader(self):
+        """
+        Declara-se líder e anuncia para todos
+        """
+        with self.lock:
+            self.state = ProcessState.LEADER
+            self.leader_id = self.process_id
+            self.election_in_progress = False
+        
+        print(f"[P{self.process_id}] I AM THE LEADER")
+        
+        # Anuncia para todos processos com ID menor
+        lower_processes = [p for p in self.all_processes if p < self.process_id]
+        
+        for proc in lower_processes:
+            self.send_coordinator_message(proc)
+    
+    def send_coordinator_message(self, to_process):
+        """
+        Anuncia que é o novo coordenador
+        """
+        message = {
+            'type': 'COORDINATOR',
+            'from': self.process_id
+        }
+        self.send_async(message, to=to_process)
+    
+    def handle_coordinator_message(self, from_process):
+        """
+        Recebe COORDINATOR message do novo líder
+        """
+        with self.lock:
+            self.leader_id = from_process
+            self.state = ProcessState.PARTICIPANT
+            self.election_in_progress = False
+        
+        print(f"[P{self.process_id}] New leader is P{from_process}")
+    
+    def check_coordinator_timeout(self):
+        """
+        Verifica se COORDINATOR message foi recebido
+        Se não, inicia nova eleição
+        """
+        with self.lock:
+            if self.election_in_progress and self.state == ProcessState.WAITING:
+                print(f"[P{self.process_id}] Coordinator timeout, restarting election")
+                self.election_in_progress = False
+        
+        self.start_election()
+```
+
+**Complexidade do Bully:**
+- **Messages**: O(n²) no pior caso
+- **Time**: O(n) rounds no pior caso
+
+#### 3.1.2 Algoritmo Ring
+
+Processos organizados em anel lógico, eleição percorre o anel.
+
+```python
+class RingElectionAlgorithm:
+    """
+    Algoritmo de eleição em anel
+    Mais eficiente que Bully em termos de mensagens
+    """
+    def __init__(self, process_id, all_processes):
+        self.process_id = process_id
+        # Organiza processos em anel
+        self.ring = sorted(all_processes)
+        self.next_process = self._get_next_in_ring()
+        
+        self.leader_id = None
+        self.election_in_progress = False
+        self.lock = threading.Lock()
+    
+    def _get_next_in_ring(self):
+        """
+        Retorna próximo processo no anel
+        """
+        idx = self.ring.index(self.process_id)
+        next_idx = (idx + 1) % len(self.ring)
+        return self.ring[next_idx]
+    
+    def start_election(self):
+        """
+        Inicia eleição enviando ELECTION com próprio ID
+        """
+        with self.lock:
+            if self.election_in_progress:
+                return
+            self.election_in_progress = True
+        
+        print(f"[P{self.process_id}] Starting ring election")
+        
+        # Cria ELECTION message com próprio ID
+        participants = [self.process_id]
+        self.send_election(participants)
+    
+    def send_election(self, participants):
+        """
+        Envia ELECTION message para próximo no anel
+        """
+        message = {
+            'type': 'ELECTION',
+            'participants': participants
+        }
+        
+        print(f"[P{self.process_id}] Sending ELECTION with participants: {participants}")
+        
+        self.send_to_next(message)
+    
+    def handle_election(self, participants):
+        """
+        Recebe ELECTION message
+        """
+        print(f"[P{self.process_id}] Received ELECTION with participants: {participants}")
+        
+        if self.process_id in participants:
+            # Mensagem voltou completa: Elege líder
+            new_leader = max(participants)
+            self.announce_leader(new_leader)
+        else:
+            # Adiciona próprio ID e encaminha
+            participants.append(self.process_id)
+            self.send_election(participants)
+    
+    def announce_leader(self, leader_id):
+        """
+        Anuncia novo líder circulando COORDINATOR message
+        """
+        with self.lock:
+            self.leader_id = leader_id
+            self.election_in_progress = False
+        
+        print(f"[P{self.process_id}] Announcing leader: P{leader_id}")
+        
+        message = {
+            'type': 'COORDINATOR',
+            'leader': leader_id
+        }
+        self.send_to_next(message)
+    
+    def handle_coordinator(self, leader_id):
+        """
+        Recebe COORDINATOR message
+        """
+        with self.lock:
+            if self.leader_id == leader_id:
+                # Mensagem completou anel, para propagação
+                print(f"[P{self.process_id}] Leader announcement complete")
+                return
+            
+            self.leader_id = leader_id
+            self.election_in_progress = False
+        
+        print(f"[P{self.process_id}] New leader is P{leader_id}")
+        
+        # Propaga announcement
+        message = {
+            'type': 'COORDINATOR',
+            'leader': leader_id
+        }
+        self.send_to_next(message)
+```
+
+**Complexidade do Ring:**
+- **Messages**: 2n (n para election, n para announcement)
+- **Time**: O(n) no pior caso
+
+#### 3.1.3 Raft Leader Election
+
+Raft é um algoritmo de consenso moderno que inclui eleição de líder robusta.
+
+```python
+from enum import Enum
+import random
+
+class RaftState(Enum):
+    FOLLOWER = 1
+    CANDIDATE = 2
+    LEADER = 3
+
+class RaftLeaderElection:
+    """
+    Implementação de eleição de líder do Raft
+    """
+    def __init__(self, node_id, cluster_nodes):
+        self.node_id = node_id
+        self.cluster_nodes = cluster_nodes
+        
+        # Persistent state
+        self.current_term = 0
+        self.voted_for = None
+        
+        # Volatile state
+        self.state = RaftState.FOLLOWER
+        self.leader_id = None
+        
+        # Election timing
+        self.election_timeout = self._random_election_timeout()
+        self.last_heartbeat = time.time()
+        
+        self.lock = threading.Lock()
+        self.running = False
+    
+    def _random_election_timeout(self):
+        """
+        Timeout aleatório para evitar eleições simultâneas
+        Típico: 150-300ms
+        """
+        return random.uniform(0.15, 0.30)
+    
+    def start(self):
+        """
+        Inicia loops de eleição e heartbeat
+        """
+        self.running = True
+        
+        # Thread para monitorar election timeout
+        self.election_thread = threading.Thread(
+            target=self._election_timeout_loop,
+            daemon=True
+        )
+        self.election_thread.start()
+        
+        # Thread para enviar heartbeats (se líder)
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True
+        )
+        self.heartbeat_thread.start()
+    
+    def _election_timeout_loop(self):
+        """
+        Monitora timeout de eleição
+        """
+        while self.running:
+            time.sleep(0.01)  # Check a cada 10ms
+            
+            with self.lock:
+                if self.state == RaftState.LEADER:
+                    continue  # Líder não inicia eleições
+                
+                time_since_heartbeat = time.time() - self.last_heartbeat
+                
+                if time_since_heartbeat >= self.election_timeout:
+                    # Timeout! Iniciar eleição
+                    self.start_election()
+    
+    def start_election(self):
+        """
+        Transição para CANDIDATE e inicia eleição
+        """
+        # Incrementa term
+        self.current_term += 1
+        self.state = RaftState.CANDIDATE
+        self.voted_for = self.node_id  # Vota em si mesmo
+        self.election_timeout = self._random_election_timeout()
+        self.last_heartbeat = time.time()
+        
+        print(f"[Node {self.node_id}] Starting election for term {self.current_term}")
+        
+        # Conta próprio voto
+        votes_received = 1
+        
+        # Request votes de outros nodes
+        for node in self.cluster_nodes:
+            if node == self.node_id:
+                continue
+            
+            vote_granted = self.request_vote(node)
+            if vote_granted:
+                votes_received += 1
+        
+        # Verifica se ganhou eleição (maioria)
+        quorum = len(self.cluster_nodes) // 2 + 1
+        
+        if votes_received >= quorum:
+            self.become_leader()
+        else:
+            # Não ganhou, volta para follower
+            print(f"[Node {self.node_id}] Lost election (got {votes_received}/{len(self.cluster_nodes)} votes)")
+            self.state = RaftState.FOLLOWER
+    
+    def request_vote(self, target_node):
+        """
+        Envia RequestVote RPC
+        """
+        message = {
+            'type': 'RequestVote',
+            'term': self.current_term,
+            'candidate_id': self.node_id
+        }
+        
+        try:
+            response = self.send_rpc(message, to=target_node, timeout=0.1)
+            
+            if response:
+                # Se descobrir term maior, volta para follower
+                if response['term'] > self.current_term:
+                    self.current_term = response['term']
+                    self.state = RaftState.FOLLOWER
+                    self.voted_for = None
+                    return False
+                
+                return response.get('vote_granted', False)
+        
+        except TimeoutError:
+            return False
+        
+        return False
+    
+    def handle_request_vote(self, candidate_id, candidate_term):
+        """
+        Processa RequestVote RPC recebido
+        """
+        with self.lock:
+            # Se term é antigo, rejeita
+            if candidate_term < self.current_term:
+                return {
+                    'term': self.current_term,
+                    'vote_granted': False
+                }
+            
+            # Se term é mais novo, atualiza
+            if candidate_term > self.current_term:
+                self.current_term = candidate_term
+                self.state = RaftState.FOLLOWER
+                self.voted_for = None
+            
+            # Vota se ainda não votou neste term
+            vote_granted = False
+            if self.voted_for is None or self.voted_for == candidate_id:
+                self.voted_for = candidate_id
+                vote_granted = True
+                self.last_heartbeat = time.time()  # Reset election timeout
+                
+                print(f"[Node {self.node_id}] Voted for {candidate_id} in term {candidate_term}")
+            
+            return {
+                'term': self.current_term,
+                'vote_granted': vote_granted
+            }
+    
+    def become_leader(self):
+        """
+        Transição para LEADER
+        """
+        self.state = RaftState.LEADER
+        self.leader_id = self.node_id
+        
+        print(f"[Node {self.node_id}] BECAME LEADER for term {self.current_term}")
+        
+        # Começa a enviar heartbeats
+        self.send_heartbeats()
+    
+    def _heartbeat_loop(self):
+        """
+        Envia heartbeats periódicos se líder
+        """
+        heartbeat_interval = 0.05  # 50ms
+        
+        while self.running:
+            time.sleep(heartbeat_interval)
+            
+            with self.lock:
+                if self.state == RaftState.LEADER:
+                    self.send_heartbeats()
+    
+    def send_heartbeats(self):
+        """
+        Envia AppendEntries (heartbeat) para todos followers
+        """
+        for node in self.cluster_nodes:
+            if node == self.node_id:
+                continue
+            
+            message = {
+                'type': 'AppendEntries',
+                'term': self.current_term,
+                'leader_id': self.node_id
+            }
+            
+            try:
+                response = self.send_rpc(message, to=node, timeout=0.05)
+                
+                if response and response['term'] > self.current_term:
+                    # Descobriu term maior: Step down
+                    self.current_term = response['term']
+                    self.state = RaftState.FOLLOWER
+                    self.voted_for = None
+                    self.leader_id = None
+                    print(f"[Node {self.node_id}] Stepping down, higher term discovered")
+                    break
+            
+            except TimeoutError:
+                pass
+    
+    def handle_append_entries(self, leader_id, leader_term):
+        """
+        Processa AppendEntries (heartbeat) recebido
+        """
+        with self.lock:
+            # Se term é antigo, rejeita
+            if leader_term < self.current_term:
+                return {
+                    'term': self.current_term,
+                    'success': False
+                }
+            
+            # Heartbeat válido: Reset election timeout
+            self.last_heartbeat = time.time()
+            self.election_timeout = self._random_election_timeout()
+            
+            # Se term é novo, atualiza
+            if leader_term > self.current_term:
+                self.current_term = leader_term
+                self.voted_for = None
+            
+            # Reconhece líder
+            if self.state != RaftState.FOLLOWER:
+                self.state = RaftState.FOLLOWER
+            
+            self.leader_id = leader_id
+            
+            return {
+                'term': self.current_term,
+                'success': True
+            }
+```
+
+**Propriedades do Raft Leader Election:**
+
+- **Safety**: No máximo 1 líder por term (epoch)
+- **Liveness**: Eventualmente um líder é eleito (com probabilidade 1)
+- **Randomization**: Election timeouts aleatórios previnem eleições simultâneas
+- **Robustness**: Tolera crashes e network partitions
+
+**Uso em Sistemas Reais:**
+
+- **etcd**: Distributed configuration store (Kubernetes)
+- **Consul**: Service discovery
+- **CockroachDB**: Distributed SQL database
+- **TiKV**: Distributed transactional key-value store
+
+---
+
+## 4. Exclusão Mútua Distribuída
+
+### 4.1 O Problema
+
+Garantir que apenas um processo por vez acessa recurso compartilhado (seção crítica), sem relógio global ou memória compartilhada.
+
+**Requisitos:**
+
+- **Mutual Exclusion**: No máximo um processo na seção crítica
+- **Deadlock Freedom**: Se algum processo quer entrar, algum eventualmente entra
+- **Fairness**: Requests são atendidas em ordem (opcional)
+
+#### 4.1.1 Algoritmo de Lamport
+
+Usa timestamps lógicos para ordenar requests.
+
+```python
+class LamportMutualExclusion:
+    """
+    Algoritmo de exclusão mútua de Lamport
+    Usa timestamps lógicos para ordenação total de requests
+    """
+    def __init__(self, process_id, all_processes):
+        self.process_id = process_id
+        self.all_processes = all_processes
+        self.clock = LamportClock(process_id)
+        
+        # Request queue (ordenada por timestamp)
+        self.request_queue = []  # [(timestamp, process_id)]
+        
+        # Acknowledgements recebidos
+        self.acks = set()
+        
+        self.in_critical_section = False
+        self.lock = threading.Lock()
+    
+    def request_critical_section(self):
+        """
+        Request acesso à seção crítica
+        """
+        # Gera timestamp para request
+        request_timestamp = self.clock.send_timestamp()
+        
+        with self.lock:
+            # Adiciona próprio request na queue
+            self.request_queue.append((request_timestamp, self.process_id))
+            self.request_queue.sort()  # Mantém ordenada
+        
+        print(f"[P{self.process_id}] Requesting CS at timestamp {request_timestamp}")
+        
+        # Envia REQUEST para todos os outros processos
+        for proc in self.all_processes:
+            if proc != self.process_id:
+                self.send_request(proc, request_timestamp)
+        
+        # Espera condições para entrar:
+        # 1. Próprio request é o menor na queue
+        # 2. Recebeu ACK de todos os outros processos
+        self.wait_for_permission()
+    
+    def send_request(self, to_process, timestamp):
+        """
+        Envia REQUEST message
+        """
+        message = {
+            'type': 'REQUEST',
+            'from': self.process_id,
+            'timestamp': timestamp
+        }
+        self.send_message(message, to=to_process)
+    
+    def handle_request(self, from_process, timestamp):
+        """
+        Processa REQUEST recebido
+        """
+        # Atualiza clock lógico
+        self.clock.receive_timestamp(timestamp)
+        
+        with self.lock:
+            # Adiciona request na queue
+            self.request_queue.append((timestamp, from_process))
+            self.request_queue.sort()
+        
+        print(f"[P{self.process_id}] Received REQUEST from P{from_process} at {timestamp}")
+        
+        # Envia ACK
+        self.send_ack(from_process)
+    
+    def send_ack(self, to_process):
+        """
+        Envia ACK message
+        """
+        ack_timestamp = self.clock.send_timestamp()
+        
+        message = {
+            'type': 'ACK',
+            'from': self.process_id,
+            'timestamp': ack_timestamp
+        }
+        self.send_message(message, to=to_process)
+    
+    def handle_ack(self, from_process):
+        """
+        Processa ACK recebido
+        """
+        with self.lock:
+            self.acks.add(from_process)
+        
+        print(f"[P{self.process_id}] Received ACK from P{from_process}")
+        
+        # Verifica se pode entrar na CS
+        self.check_permission()
+    
+    def wait_for_permission(self):
+        """
+        Espera até ter permissão para entrar na CS
+        """
+        while True:
+            with self.lock:
+                if self.can_enter_cs():
+                    self.in_critical_section = True
+                    print(f"[P{self.process_id}] ENTERING Critical Section")
+                    return
+            
+            time.sleep(0.01)  # Polling
+    
+    def can_enter_cs(self):
+        """
+        Verifica se pode entrar na seção crítica
+        """
+        if not self.request_queue:
+            return False
+        
+        # Próprio request deve ser o primeiro
+        first_request = self.request_queue[0]
+        if first_request[1] != self.process_id:
+            return False
+        
+        # Deve ter ACK de todos
+        other_processes = set(self.all_processes) - {self.process_id}
+        if not other_processes.issubset(self.acks):
+            return False
+        
+        return True
+    
+    def release_critical_section(self):
+        """
+        Release seção crítica
+        """
+        print(f"[P{self.process_id}] LEAVING Critical Section")
+        
+        with self.lock:
+            # Remove próprio request da queue
+            self.request_queue = [
+                (ts, pid) for ts, pid in self.request_queue
+                if pid != self.process_id
+            ]
+            
+            # Limpa ACKs
+            self.acks.clear()
+            
+            self.in_critical_section = False
+        
+        # Envia RELEASE para todos
+        for proc in self.all_processes:
+            if proc != self.process_id:
+                self.send_release(proc)
+    
+    def send_release(self, to_process):
+        """
+        Envia RELEASE message
+        """
+        release_timestamp = self.clock.send_timestamp()
+        
+        message = {
+            'type': 'RELEASE',
+            'from': self.process_id,
+            'timestamp': release_timestamp
+        }
+        self.send_message(message, to=to_process)
+    
+    def handle_release(self, from_process):
+        """
+        Processa RELEASE recebido
+        """
+        with self.lock:
+            # Remove request de from_process da queue
+            self.request_queue = [
+                (ts, pid) for ts, pid in self.request_queue
+                if pid != from_process
+            ]
+        
+        print(f"[P{self.process_id}] Received RELEASE from P{from_process}")
+```
+
+**Complexidade do Algoritmo de Lamport:**
+- **Messages**: 3(n-1) por entrada na CS (REQUEST, ACK, RELEASE)
+- **Synchronization delay**: 1 message delay
+
+#### 4.1.2 Algoritmo de Ricart-Agrawala
+
+Otimização do Lamport, reduz mensagens eliminando ACKs explícitos.
+
+```python
+class RicartAgrawalaExclusion:
+    """
+    Algoritmo de Ricart-Agrawala
+    Otimização do Lamport que economiza mensagens
+    """
+    def __init__(self, process_id, all_processes):
+        self.process_id = process_id
+        self.all_processes = all_processes
+        self.clock = LamportClock(process_id)
+        
+        # Estado do request
+        self.requesting = False
+        self.my_request_timestamp = None
+        
+        # Deferred replies (processos que queremos fazer reply depois)
+        self.deferred_replies = set()
+        
+        # Replies recebidos
+        self.replies_received = set()
+        
+        self.lock = threading.Lock()
+    
+    def request_critical_section(self):
+        """
+        Request seção crítica
+        """
+        self.requesting = True
+        self.my_request_timestamp = self.clock.send_timestamp()
+        
+        print(f"[P{self.process_id}] Requesting CS at {self.my_request_timestamp}")
+        
+        # Envia REQUEST para todos
+        for proc in self.all_processes:
+            if proc != self.process_id:
+                self.send_request(proc, self.my_request_timestamp)
+        
+        # Espera REPLY de todos
+        self.wait_for_replies()
+    
+    def handle_request(self, from_process, timestamp):
+        """
+        Processa REQUEST recebido
+        """
+        self.clock.receive_timestamp(timestamp)
+        
+        with self.lock:
+            if not self.requesting:
+                # Não estamos interessados: Reply imediatamente
+                self.send_reply(from_process)
+            elif timestamp < self.my_request_timestamp or (
+                timestamp == self.my_request_timestamp and
+                from_process < self.process_id  # Tiebreak por ID
+            ):
+                # Request dele tem prioridade: Reply imediatamente
+                self.send_reply(from_process)
+            else:
+                # Nosso request tem prioridade: Defer reply
+                self.deferred_replies.add(from_process)
+                print(f"[P{self.process_id}] Deferring reply to P{from_process}")
+    
+    def handle_reply(self, from_process):
+        """
+        Processa REPLY recebido
+        """
+        with self.lock:
+            self.replies_received.add(from_process)
+    
+    def wait_for_replies(self):
+        """
+        Espera REPLY de todos os outros processos
+        """
+        other_processes = set(self.all_processes) - {self.process_id}
+        
+        while True:
+            with self.lock:
+                if other_processes.issubset(self.replies_received):
+                    print(f"[P{self.process_id}] ENTERING Critical Section")
+                    return
+            
+            time.sleep(0.01)
+    
+    def release_critical_section(self):
+        """
+        Release seção crítica
+        """
+        print(f"[P{self.process_id}] LEAVING Critical Section")
+        
+        with self.lock:
+            self.requesting = False
+            self.replies_received.clear()
+            
+            # Envia REPLY para processos deferred
+            for proc in self.deferred_replies:
+                self.send_reply(proc)
+            
+            self.deferred_replies.clear()
+```
+
+**Complexidade de Ricart-Agrawala:**
+- **Messages**: 2(n-1) por entrada (REQUEST, REPLY)
+- **Melhoria**: 33% menos mensagens que Lamport
+
+#### 4.1.3 Token Ring
+
+Abordagem diferente: Token circula, quem tem token pode entrar na CS.
+
+```python
+class TokenRingExclusion:
+    """
+    Exclusão mútua com token ring
+    Token circula, quem tem pode entrar na CS
+    """
+    def __init__(self, process_id, ring_processes):
+        self.process_id = process_id
+        self.ring = ring_processes
+        self.next_process = self._get_next()
+        
+        # Token state
+        self.has_token = (process_id == ring_processes[0])  # P0 inicia com token
+        self.wants_cs = False
+        
+        self.lock = threading.Lock()
+    
+    def _get_next(self):
+        """Próximo processo no anel"""
+        idx = self.ring.index(self.process_id)
+        return self.ring[(idx + 1) % len(self.ring)]
+    
+    def request_critical_section(self):
+        """
+        Request seção crítica
+        """
+        with self.lock:
+            self.wants_cs = True
+        
+        print(f"[P{self.process_id}] Wanting CS")
+        
+        # Espera até ter token
+        while True:
+            with self.lock:
+                if self.has_token:
+                    print(f"[P{self.process_id}] ENTERING CS (have token)")
+                    return
+            
+            time.sleep(0.01)
+    
+    def release_critical_section(self):
+        """
+        Release seção crítica
+        """
+        print(f"[P{self.process_id}] LEAVING CS")
+        
+        with self.lock:
+            self.wants_cs = False
+            
+            # Passa token para próximo
+            self.pass_token()
+    
+    def pass_token(self):
+        """
+        Passa token para próximo processo no anel
+        """
+        if not self.has_token:
+            return
+        
+        self.has_token = False
+        
+        message = {
+            'type': 'TOKEN',
+            'from': self.process_id
+        }
+        
+        print(f"[P{self.process_id}] Passing token to P{self.next_process}")
+        self.send_message(message, to=self.next_process)
+    
+    def handle_token(self, from_process):
+        """
+        Recebe token
+        """
+        with self.lock:
+            self.has_token = True
+        
+        print(f"[P{self.process_id}] Received token from P{from_process}")
+        
+        # Se não quer CS, passa token imediatamente
+        if not self.wants_cs:
+            time.sleep(0.001)  # Small delay
+            self.pass_token()
+```
+
+**Vantagens do Token Ring:**
+- **Messages**: 1 por passagem de token (muito eficiente se alta demanda)
+- **Fairness**: FIFO order garantida
+- **Desvantagens**: Token pode se perder (requer regeneração), latência se baixa demanda
+
+---
+
