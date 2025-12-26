@@ -2659,7 +2659,7 @@ class RaftLogReplication:
 
 Técnica fundamental: replicar state machine através de log ordenado de comandos.
 
-**Princípio**: Se múltiplas state machines identical começam no mesmo estado e executam mesma sequência de comandos, terminarão no mesmo estado.
+**Princípio**: Se múltiplas state machines idênticas começam no mesmo estado e executam mesma sequência de comandos, terminarão no mesmo estado.
 
 **Implementação:**
 1. Client envia comando para leader
