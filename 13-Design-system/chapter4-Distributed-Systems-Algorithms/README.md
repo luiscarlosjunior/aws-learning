@@ -2488,3 +2488,915 @@ class TokenRingExclusion:
 
 ---
 
+
+## 5. Consenso e Replicação por Máquina de Estados
+
+### 5.1 O Problema do Consenso
+
+O consenso é um dos problemas fundamentais em sistemas distribuídos: processos devem concordar sobre um valor, mesmo na presença de falhas.
+
+**Propriedades do Consenso:**
+
+- **Termination**: Todo processo correto eventualmente decide um valor
+- **Validity**: Se um processo decide v, então v foi proposto por algum processo
+- **Integrity**: Nenhum processo decide duas vezes
+- **Agreement**: Todos os processos corretos decidem o mesmo valor
+
+**Impossibilidade FLP**: Em sistemas assíncronos, não existe algoritmo determinístico que resolve consenso mesmo com apenas 1 falha por crash (Fischer, Lynch, Paterson, 1985).
+
+### 5.2 Algoritmos de Consenso Práticos
+
+#### Paxos
+
+Algoritmo clássico de Leslie Lamport, garante consenso apesar de falhas.
+
+**Papéis:**
+- **Proposers**: Propõem valores
+- **Acceptors**: Votam em propostas (quorum de acceptors decide)
+- **Learners**: Aprendem valor decidido
+
+**Fases:**
+1. **Prepare**: Proposer envia número de proposta, acceptors prometem não aceitar propostas menores
+2. **Accept**: Proposer envia valor, acceptors aceitam se não prometeram para proposta maior
+3. **Learn**: Quando quorum aceita, learners são notificados
+
+**Uso**: Google Chubby, Apache ZooKeeper (variação: ZAB)
+
+#### Raft
+
+Algoritmo moderno, mais compreensível que Paxos, mesmas garantias.
+
+**Componentes:**
+- **Leader Election**: Já vimos na seção 3
+- **Log Replication**: Leader replica comandos para followers
+- **Safety**: Garante que logs não divergem
+
+**Replicação de Log:**
+```python
+class RaftLogReplication:
+    """
+    Replicação de log do Raft
+    """
+    def __init__(self, node_id, cluster_nodes):
+        self.node_id = node_id
+        self.cluster_nodes = cluster_nodes
+        
+        # Persistent state
+        self.log = []  # [(term, command)]
+        self.current_term = 0
+        
+        # Volatile state on leaders
+        self.next_index = {node: 1 for node in cluster_nodes}  # Próximo índice para enviar
+        self.match_index = {node: 0 for node in cluster_nodes}  # Maior índice replicado
+        
+        # Volatile state on all
+        self.commit_index = 0  # Maior índice committed
+        self.last_applied = 0  # Último índice aplicado à state machine
+    
+    def append_entry(self, command):
+        """
+        Leader recebe comando do client
+        """
+        # Adiciona ao log local
+        entry = (self.current_term, command)
+        self.log.append(entry)
+        log_index = len(self.log)
+        
+        print(f"[Leader] Appended command to log at index {log_index}")
+        
+        # Replica para followers
+        self.replicate_to_followers()
+        
+        return log_index
+    
+    def replicate_to_followers(self):
+        """
+        Envia AppendEntries para todos followers
+        """
+        for follower in self.cluster_nodes:
+            if follower == self.node_id:
+                continue
+            
+            self.send_append_entries(follower)
+    
+    def send_append_entries(self, follower):
+        """
+        Envia AppendEntries RPC para follower específico
+        """
+        next_idx = self.next_index[follower]
+        
+        # Entradas a enviar
+        entries = self.log[next_idx-1:] if next_idx <= len(self.log) else []
+        
+        # Prev log info (para consistency check)
+        prev_log_index = next_idx - 1
+        prev_log_term = self.log[prev_log_index-1][0] if prev_log_index > 0 else 0
+        
+        message = {
+            'type': 'AppendEntries',
+            'term': self.current_term,
+            'leader_id': self.node_id,
+            'prev_log_index': prev_log_index,
+            'prev_log_term': prev_log_term,
+            'entries': entries,
+            'leader_commit': self.commit_index
+        }
+        
+        response = self.send_rpc(message, to=follower)
+        
+        if response['success']:
+            # Atualiza next_index e match_index
+            self.next_index[follower] = next_idx + len(entries)
+            self.match_index[follower] = self.next_index[follower] - 1
+            
+            # Verifica se pode commitar
+            self.advance_commit_index()
+        else:
+            # Log inconsistente, decrementa next_index e retry
+            self.next_index[follower] = max(1, self.next_index[follower] - 1)
+    
+    def advance_commit_index(self):
+        """
+        Avança commit_index se quorum replicou
+        """
+        # Procura maior índice N tal que:
+        # - N > commit_index
+        # - Maioria dos match_index[i] >= N
+        # - log[N].term == current_term
+        
+        for n in range(self.commit_index + 1, len(self.log) + 1):
+            if self.log[n-1][0] == self.current_term:
+                # Conta quantos nodes têm esse índice
+                count = sum(1 for idx in self.match_index.values() if idx >= n)
+                
+                quorum = len(self.cluster_nodes) // 2 + 1
+                
+                if count >= quorum:
+                    self.commit_index = n
+                    print(f"[Leader] Committed up to index {n}")
+                    
+                    # Aplica comandos committed à state machine
+                    self.apply_committed_entries()
+    
+    def apply_committed_entries(self):
+        """
+        Aplica entradas committed à state machine
+        """
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            term, command = self.log[self.last_applied - 1]
+            
+            # Aplica comando
+            result = self.apply_to_state_machine(command)
+            print(f"[Node {self.node_id}] Applied command at index {self.last_applied}: {command}")
+```
+
+**Garantias do Raft:**
+- **State Machine Safety**: Se um servidor aplicou log entry no índice X, nenhum outro aplicará comando diferente no mesmo índice
+- **Leader Completeness**: Se um log entry é committed em algum term, estará presente em todos logs de leaders de terms futuros
+
+### 5.3 State Machine Replication
+
+Técnica fundamental: replicar state machine através de log ordenado de comandos.
+
+**Princípio**: Se múltiplas state machines identical começam no mesmo estado e executam mesma sequência de comandos, terminarão no mesmo estado.
+
+**Implementação:**
+1. Client envia comando para leader
+2. Leader append ao log e replica para followers
+3. Quando committed (quorum replicou), aplica à state machine
+4. Leader responde ao client
+
+**Uso em AWS:**
+- **Amazon Aurora**: Replicação de storage usando consenso
+- **DynamoDB**: Replicação entre availability zones
+
+---
+
+## 6. Broadcast Atômico e Ordenado
+
+### 6.1 Tipos de Broadcast
+
+**Regular Broadcast:**
+- Processo envia mensagem para todos
+- Não garante ordem
+
+**Reliable Broadcast:**
+- Se um correto entrega, todos corretos eventualmente entregam
+- Não garante ordem
+
+**Atomic Broadcast (Total Order Broadcast):**
+- Todos processos corretos entregam mesmas mensagens
+- Na mesma ordem
+- Equivalente a consenso!
+
+### 6.2 Implementação com Consenso
+
+```python
+class AtomicBroadcast:
+    """
+    Atomic Broadcast usando consenso
+    """
+    def __init__(self, process_id, consensus_algorithm):
+        self.process_id = process_id
+        self.consensus = consensus_algorithm
+        
+        # Sequência de mensagens decididas
+        self.sequence = []
+        self.sequence_number = 0
+        
+        # Buffer de mensagens pendentes
+        self.pending = []
+    
+    def broadcast(self, message):
+        """
+        Broadcast atômico de mensagem
+        """
+        # Adiciona ao pending
+        self.pending.append(message)
+        
+        # Propõe próximo batch via consenso
+        self.propose_next_batch()
+    
+    def propose_next_batch(self):
+        """
+        Propõe próximo batch de mensagens via consenso
+        """
+        if not self.pending:
+            return
+        
+        # Propõe batch
+        batch = self.pending[:10]  # Até 10 mensagens
+        
+        # Usa consenso para decidir próximo batch
+        decided_batch = self.consensus.propose(batch)
+        
+        # Entrega mensagens em ordem
+        for msg in decided_batch:
+            self.deliver(msg)
+            
+            # Remove de pending
+            if msg in self.pending:
+                self.pending.remove(msg)
+    
+    def deliver(self, message):
+        """
+        Entrega mensagem à aplicação
+        """
+        self.sequence.append(message)
+        self.sequence_number += 1
+        
+        print(f"[P{self.process_id}] Delivered message {self.sequence_number}: {message}")
+        
+        # Aplicação processa mensagem
+        self.process_message(message)
+```
+
+**Propriedades:**
+- **Validity**: Se correto broadcasts m, eventualmente entrega m
+- **Uniform Agreement**: Se um processo (correto ou não) entrega m, todos corretos entregam m
+- **Uniform Integrity**: Entrega m no máximo uma vez
+- **Uniform Total Order**: Se processos P e Q entregam m e m', entregam na mesma ordem
+
+**Uso:**
+- **Apache Kafka**: Partitions com ordering garantido
+- **Apache ZooKeeper**: ZAB protocol para atomic broadcast
+
+---
+
+## 7. Replicação, Consistência e Quoruns
+
+### 7.1 Modelos de Consistência
+
+**Strong Consistency (Linearizability):**
+- Sistema se comporta como se houvesse cópia única
+- Operações parecem instantâneas
+- Exemplo: ZooKeeper, etcd
+
+**Sequential Consistency:**
+- Operações parecem executar em alguma ordem sequencial
+- Ordem pode não respeitar tempo real
+- Mais fraca que linearizability
+
+**Causal Consistency:**
+- Operações causalmente relacionadas vistas na mesma ordem
+- Operações concorrentes podem ser vistas em ordem diferente
+- Exemplo: Amazon DynamoDB eventual consistency
+
+**Eventual Consistency:**
+- Se pararem updates, replicas eventualmente convergem
+- Mais fraca, mas alta disponibilidade
+- Exemplo: Cassandra, Riak
+
+### 7.2 Quorum Systems
+
+**Princípio**: Para garantir consistência, intersecção entre quorums de read e write.
+
+**Quorum Clássico:**
+- N replicas total
+- W = write quorum (quantas replicas devem ack write)
+- R = read quorum (quantas replicas devem responder read)
+- **Regra**: W + R > N (garante overlap)
+
+**Exemplos:**
+```python
+# Strong consistency: R + W > N
+# R = W = N/2 + 1
+# Exemplo: N=5, R=3, W=3
+# 3 + 3 = 6 > 5 ✓
+
+# Eventual consistency: R + W <= N  
+# R = 1, W = 1
+# 1 + 1 = 2 <= 5 (sem overlap garantido)
+
+# Read-optimized: R=1, W=N
+# Write é lento, Read é rápido
+
+# Write-optimized: R=N, W=1
+# Write é rápido, Read é lento
+```
+
+**Sloppy Quorum (Dynamo-style):**
+- Se replica primária está down, escreve em replica secundária
+- "Hinted handoff" transfere para primária quando volta
+- Maior disponibilidade, consistência mais fraca
+
+**Uso em AWS:**
+- **DynamoDB**: Quorums configuráveis (eventual ou strong consistency)
+- **S3**: Replicação eventual com read-after-write consistency
+
+---
+
+## 8. Transações Distribuídas e Commit
+
+### 8.1 Two-Phase Commit (2PC)
+
+Protocolo clássico para commit atômico em transações distribuídas.
+
+**Participantes:**
+- **Coordinator**: Coordena transação
+- **Participants**: Recursos transacionais (databases)
+
+**Fases:**
+
+**Phase 1 - Prepare:**
+1. Coordinator envia PREPARE para todos participants
+2. Participants executam transação localmente, escrevem undo/redo logs
+3. Participants respondem YES (podem commit) ou NO (devem abort)
+
+**Phase 2 - Commit/Abort:**
+1. Se todos YES: Coordinator decide COMMIT
+2. Se algum NO ou timeout: Coordinator decide ABORT
+3. Coordinator envia decisão para todos
+4. Participants executam decisão e respondem ACK
+
+```python
+class TwoPhaseCommit:
+    """
+    Two-Phase Commit protocol
+    """
+    def __init__(self, coordinator_id):
+        self.coordinator_id = coordinator_id
+        self.transaction_log = []
+    
+    def execute_transaction(self, participants, transaction):
+        """
+        Executa transação distribuída via 2PC
+        """
+        tx_id = self.generate_tx_id()
+        
+        print(f"[Coordinator] Starting transaction {tx_id}")
+        
+        # Phase 1: Prepare
+        prepare_votes = self.phase1_prepare(tx_id, participants, transaction)
+        
+        # Decide
+        if all(vote == 'YES' for vote in prepare_votes.values()):
+            decision = 'COMMIT'
+        else:
+            decision = 'ABORT'
+        
+        print(f"[Coordinator] Decision for {tx_id}: {decision}")
+        
+        # Log decision (crucial para recovery)
+        self.log_decision(tx_id, decision)
+        
+        # Phase 2: Commit ou Abort
+        self.phase2_decision(tx_id, participants, decision)
+        
+        return decision
+    
+    def phase1_prepare(self, tx_id, participants, transaction):
+        """
+        Phase 1: Send PREPARE, collect votes
+        """
+        votes = {}
+        
+        for participant in participants:
+            message = {
+                'type': 'PREPARE',
+                'tx_id': tx_id,
+                'transaction': transaction
+            }
+            
+            try:
+                response = self.send_with_timeout(message, to=participant, timeout=10.0)
+                votes[participant] = response['vote']  # 'YES' or 'NO'
+            except TimeoutError:
+                # Timeout = NO vote
+                votes[participant] = 'NO'
+        
+        return votes
+    
+    def phase2_decision(self, tx_id, participants, decision):
+        """
+        Phase 2: Send decision, collect ACKs
+        """
+        for participant in participants:
+            message = {
+                'type': decision,  # 'COMMIT' or 'ABORT'
+                'tx_id': tx_id
+            }
+            
+            # Send decision (retry até receber ACK)
+            while True:
+                try:
+                    response = self.send_with_timeout(message, to=participant, timeout=10.0)
+                    if response['type'] == 'ACK':
+                        break
+                except TimeoutError:
+                    # Retry
+                    time.sleep(1.0)
+        
+        print(f"[Coordinator] Transaction {tx_id} completed")
+
+
+class TwoPhaseCommitParticipant:
+    """
+    Participant em 2PC
+    """
+    def __init__(self, participant_id):
+        self.participant_id = participant_id
+        self.prepared_transactions = {}  # tx_id -> prepared state
+    
+    def handle_prepare(self, tx_id, transaction):
+        """
+        Handle PREPARE message
+        """
+        print(f"[Participant {self.participant_id}] Received PREPARE for {tx_id}")
+        
+        try:
+            # Executa transação localmente
+            result = self.execute_local(transaction)
+            
+            # Escreve undo/redo log
+            self.write_prepare_log(tx_id, transaction, result)
+            
+            # Pode commit?
+            can_commit = self.can_commit(transaction, result)
+            
+            if can_commit:
+                # Guarda estado prepared
+                self.prepared_transactions[tx_id] = result
+                
+                return {'vote': 'YES'}
+            else:
+                # Rollback local
+                self.rollback_local(transaction)
+                return {'vote': 'NO'}
+        
+        except Exception as e:
+            print(f"[Participant] Error in prepare: {e}")
+            return {'vote': 'NO'}
+    
+    def handle_commit(self, tx_id):
+        """
+        Handle COMMIT decision
+        """
+        print(f"[Participant {self.participant_id}] COMMITTING {tx_id}")
+        
+        if tx_id in self.prepared_transactions:
+            # Commit locally
+            self.commit_local(tx_id, self.prepared_transactions[tx_id])
+            
+            # Escreve commit log
+            self.write_commit_log(tx_id)
+            
+            # Cleanup
+            del self.prepared_transactions[tx_id]
+        
+        return {'type': 'ACK'}
+    
+    def handle_abort(self, tx_id):
+        """
+        Handle ABORT decision
+        """
+        print(f"[Participant {self.participant_id}] ABORTING {tx_id}")
+        
+        if tx_id in self.prepared_transactions:
+            # Rollback using undo log
+            self.rollback_local(tx_id)
+            
+            # Escreve abort log
+            self.write_abort_log(tx_id)
+            
+            # Cleanup
+            del self.prepared_transactions[tx_id]
+        
+        return {'type': 'ACK'}
+```
+
+**Problemas do 2PC:**
+- **Blocking**: Se coordinator falha após PREPARE, participants ficam bloqueados
+- **Single point of failure**: Coordinator failure paralisa sistema
+
+### 8.2 Three-Phase Commit (3PC)
+
+Adiciona fase intermediária para eliminar blocking.
+
+**Fases:**
+1. **CanCommit**: Verifica se todos podem commit
+2. **PreCommit**: Prepara para commit (mas ainda pode abortar)
+3. **DoCommit**: Commit definitivo
+
+**Vantagem**: Não-blocking (com timeout, participants podem progredir)
+**Desvantagem**: Mais complexo, mais mensagens
+
+### 8.3 Alternativas Modernas
+
+**Sagas (Long-Running Transactions):**
+- Sequência de transações locais
+- Cada transação tem compensação para undo
+- Se falha, executa compensações em ordem reversa
+
+**Uso**: Microservices patterns, AWS Step Functions
+
+---
+
+## 9. Snapshots e Checkpointing
+
+### 9.1 Algoritmo de Chandy-Lamport
+
+Captura snapshot global consistente de sistema distribuído sem parar execução.
+
+**Princípio**: Usa marker messages para coordenar snapshot.
+
+**Algoritmo:**
+1. Processo inicia snapshot, registra estado local, envia markers em todos canais
+2. Ao receber primeiro marker de canal C: registra estado local, registra estado de C como vazio, envia markers em outros canais
+3. Ao receber marker de canal C novamente: para de registrar mensagens de C
+
+**Propriedades:**
+- Não para aplicação
+- Snapshot é consistente (respeita causalidade)
+- Útil para checkpointing, debugging, deadlock detection
+
+### 9.2 Checkpointing Coordenado
+
+**Objetivo**: Periodicamente salva estados para recovery rápido.
+
+**Tipos:**
+- **Coordenado**: Todos processos checkpoint ao mesmo tempo
+- **Não-coordenado**: Processos checkpoint independentemente
+- **Log-based**: Combina checkpoint + message logging
+
+**Trade-offs:**
+- Coordenado: Overhead de coordenação, recovery simples
+- Não-coordenado: Sem overhead, mas "domino effect" em recovery
+
+---
+
+## 10. Particionamento, Roteamento e DHTs
+
+### 10.1 Consistent Hashing
+
+Técnica fundamental para distribuir dados uniformemente com minimal reshuffling.
+
+**Princípio:**
+- Hash ring de 0 a 2^160 - 1
+- Nodes e keys mapeados para pontos no ring
+- Key vai para primeiro node ≥ hash(key)
+
+**Propriedades:**
+- Adicionar/remover node: Apenas K/N keys movem (K = total keys, N = nodes)
+- Virtual nodes: Cada node físico = múltiplos pontos no ring (melhor balanço)
+
+**Uso:**
+- Amazon DynamoDB
+- Apache Cassandra
+- Memcached
+
+### 10.2 Distributed Hash Tables (DHT)
+
+Estruturas que distribuem hash table entre múltiplos nodes com routing eficiente.
+
+**Chord:**
+- Ring structure
+- Cada node mantém "finger table" para routing eficiente
+- Lookup: O(log N) hops
+- Join/Leave: O(log² N) messages
+
+**Kademlia:**
+- XOR metric para distância
+- Routing table baseado em prefixos
+- Lookup: O(log N) hops
+- Usado em BitTorrent, IPFS
+
+**Operações:**
+```python
+class ChordDHT:
+    """
+    Simplificação do Chord DHT
+    """
+    def __init__(self, node_id, m=160):
+        self.node_id = node_id
+        self.m = m  # Bits no key space
+        self.finger_table = [None] * m  # finger[i] = successor de (node_id + 2^i) % 2^m
+        self.successor = None
+        self.predecessor = None
+    
+    def find_successor(self, key_id):
+        """
+        Encontra node responsável por key_id
+        """
+        if self.is_between(key_id, self.node_id, self.successor):
+            return self.successor
+        else:
+            # Forward para node mais próximo
+            closest_node = self.closest_preceding_node(key_id)
+            return closest_node.find_successor(key_id)
+    
+    def closest_preceding_node(self, key_id):
+        """
+        Retorna node na finger table mais próximo de key_id
+        """
+        for i in range(self.m - 1, -1, -1):
+            if self.finger_table[i] and self.is_between(
+                self.finger_table[i].node_id,
+                self.node_id,
+                key_id
+            ):
+                return self.finger_table[i]
+        
+        return self
+    
+    def put(self, key, value):
+        """
+        Armazena key-value pair
+        """
+        key_id = self.hash(key)
+        successor = self.find_successor(key_id)
+        successor.store(key, value)
+    
+    def get(self, key):
+        """
+        Recupera value para key
+        """
+        key_id = self.hash(key)
+        successor = self.find_successor(key_id)
+        return successor.retrieve(key)
+```
+
+---
+
+## 11. Algoritmos Epidêmicos e Anti-Entropy
+
+### 11.1 Gossip Protocols
+
+Processos disseminam informação através de comunicação aleatória, similar a epidemias.
+
+**Tipos:**
+- **Anti-entropy**: Reconcilia diferenças periodicamente (pull/push/push-pull)
+- **Rumor spreading**: Dissemina updates com probabilidade decrescente
+- **Aggregation**: Calcula aggregates (sum, avg) via gossip
+
+**Propriedades:**
+- Escalável: O(log N) rounds para disseminação
+- Robusto: Tolera falhas e network partitions
+- Eventual consistency
+
+**Uso:**
+- **Cassandra**: Gossip para membership e failure detection
+- **DynamoDB**: Anti-entropy para replica synchronization
+- **Bitcoin**: Transaction propagation
+
+### 11.2 Merkle Trees
+
+Estrutura para detectar diferenças eficientemente.
+
+**Princípio:**
+- Árvore de hashes, folhas = data blocks
+- Comparar roots: se iguais, dados idênticos
+- Se diferentes, comparar filhos recursivamente
+
+**Uso em Anti-Entropy:**
+- Cassandra: Detecta diferenças entre replicas
+- DynamoDB: Merkle trees por partition
+- Git: Version control
+
+---
+
+## 12. Tolerância a Falhas Bizantinas
+
+### 12.1 O Problema Bizantino
+
+Processos podem falhar arbitrariamente (maliciosos, bugs, comprometidos).
+
+**Byzantine Fault Tolerance (BFT):**
+- Sistema progride corretamente apesar de f processos bizantinos
+- Requer N ≥ 3f + 1 processos total
+
+### 12.2 PBFT (Practical Byzantine Fault Tolerance)
+
+Algoritmo clássico BFT para sistemas permissioned.
+
+**Fases:**
+1. **Pre-prepare**: Primary propõe ordem para request
+2. **Prepare**: Replicas concordam com ordem
+3. **Commit**: Após 2f+1 prepares, replicas commitam
+4. **Reply**: Após 2f+1 commits, responde ao client
+
+**Complexidade**: O(n²) messages
+
+### 12.3 Algoritmos Modernos
+
+**HotStuff (usado em Libra/Diem):**
+- Linear message complexity O(n)
+- Usa threshold signatures
+- Mais eficiente que PBFT
+
+**Tendermint (Cosmos blockchain):**
+- BFT consensus para blockchains
+- Finalidade instantânea
+- Fork-free
+
+**Uso:**
+- **Hyperledger Fabric**: BFT optional
+- **Amazon QLDB**: Não-BFT mas imutável
+- **Blockchains**: Proof-of-Stake com BFT
+
+---
+
+## 13. Outras Classes de Algoritmos Relevantes
+
+### 13.1 Escalonamento e Fairness Distribuído
+
+**Algoritmos de Scheduling:**
+- **Work stealing**: Threads ociosos "roubam" trabalho de threads ocupados
+- **Fair queueing**: Garante fairness entre múltiplos fluxos
+- **Lottery scheduling**: Recursos alocados por probabilidade
+
+**Uso em AWS:**
+- **Lambda**: Fair scheduling entre functions
+- **ECS/Kubernetes**: Resource scheduling
+
+### 13.2 Detecção de Deadlock Distribuído
+
+**Wait-For Graph:**
+- Grafo de dependências entre transações
+- Deadlock = ciclo no grafo
+- Algoritmos distribuídos para detectar ciclos
+
+**Estratégias:**
+- **Prevention**: Ordenação de recursos
+- **Avoidance**: Banker's algorithm
+- **Detection**: Periodic detection + rollback
+
+### 13.3 Algoritmos de Agregação Particionados
+
+**Count/Sum/Avg Distribuído:**
+- **Tree aggregation**: Agregação hierárquica
+- **Gossip aggregation**: Combina valores via gossip
+- **Sketches**: HyperLogLog para distinct count, Count-Min Sketch
+
+**Uso:**
+- **Monitoring systems**: Metrics aggregation
+- **Streaming analytics**: Apache Flink, Kinesis Analytics
+
+### 13.4 Algoritmos de Fluxo e Grafo Particionados
+
+**Graph Processing:**
+- **Pregel model** (Google): Vertex-centric, BSP (Bulk Synchronous Parallel)
+- **GraphLab**: Asynchronous graph processing
+- **Graph partitioning**: Min-cut para distribuir eficientemente
+
+**Frameworks:**
+- **Apache Giraph**: Pregel implementation
+- **GraphX (Spark)**: Graph processing
+- **Neptune (AWS)**: Managed graph database
+
+**Algoritmos:**
+- PageRank distribuído
+- Shortest paths (Dijkstra distribuído)
+- Connected components
+- Community detection
+
+---
+
+## Conclusão
+
+### Resumo dos Conceitos Fundamentais
+
+Este capítulo explorou algoritmos essenciais para sistemas distribuídos:
+
+**Fundamentos de Tempo e Ordem:**
+- Relógios lógicos (Lamport, Vector, HLC) capturam causalidade sem sincronização
+- Essenciais para debugging, versionamento, e ordenação de eventos
+
+**Detecção de Falhas:**
+- Impossibilidade de detecção perfeita em sistemas assíncronos
+- SWIM e Phi Accrual como soluções práticas e adaptativas
+
+**Coordenação:**
+- Eleição de líder (Raft, Bully) para centralizar decisões
+- Exclusão mútua (Lamport, token ring) para acesso a recursos compartilhados
+
+**Consenso e Replicação:**
+- Paxos e Raft resolvem consenso apesar de falhas
+- State machine replication garante consistência através de log ordenado
+
+**Consistência:**
+- Trade-offs entre modelos (strong, causal, eventual)
+- Quorums balanceiam consistência e disponibilidade
+
+**Transações:**
+- 2PC/3PC para atomicidade em transações distribuídas
+- Sagas para long-running transactions em microservices
+
+**Particionamento:**
+- Consistent hashing e DHTs distribuem carga uniformemente
+- Minimizam reshuffling ao adicionar/remover nodes
+
+**Robustez:**
+- Gossip e anti-entropy propagam updates robustamente
+- BFT tolera falhas arbitrárias (maliciosas)
+
+### Aplicações em AWS
+
+**Amazon DynamoDB:**
+- Consistent hashing para particionamento
+- Quorums para consistência configurável
+- Vector clocks para versionamento
+- Anti-entropy para reconciliação
+
+**Amazon Aurora:**
+- Raft-like consensus para replicação
+- Quorum writes para durabilidade
+- MVCC com HLC-style timestamps
+
+**Amazon ECS/Kubernetes:**
+- Leader election para control plane
+- Gossip para service discovery
+- Distributed scheduling
+
+**AWS Lambda:**
+- Fair scheduling distribuído
+- Consistent hashing para placement
+
+### Princípios de Design
+
+1. **CAP Theorem**: Não é possível ter Consistency, Availability e Partition-tolerance simultaneamente
+2. **Eventual Consistency**: Aceitável para muitos casos, permite alta disponibilidade
+3. **Quorum-based**: Balanço configurável entre latência e consistência
+4. **Idempotency**: Operações devem ser idempotentes para retries
+5. **Timeouts**: Sempre configure timeouts apropriados
+6. **Monitoring**: Implemente observabilidade para detectar problemas
+
+### Recursos para Estudo Adicional
+
+**Livros Fundamentais:**
+- Coulouris et al. "Distributed Systems: Concepts and Design" (2011)
+- Tanenbaum & Van Steen. "Distributed Systems: Principles and Paradigms" (2017)
+- Kleppmann, M. "Designing Data-Intensive Applications" (2017)
+- Lynch, N. "Distributed Algorithms" (1996)
+
+**Papers Clássicos:**
+- Lamport, L. "Time, Clocks, and the Ordering of Events" (1978)
+- Lamport, L. "The Part-Time Parliament" (Paxos) (1998)
+- Fischer, Lynch, Paterson. "Impossibility of Distributed Consensus" (1985)
+- DeCandia et al. "Dynamo: Amazon's Highly Available Key-value Store" (2007)
+- Ongaro & Ousterhout. "In Search of an Understandable Consensus Algorithm" (Raft) (2014)
+
+**Cursos Online:**
+- MIT 6.824: Distributed Systems (com labs práticos)
+- Coursera: Cloud Computing Specialization
+- AWS Training: Architecting on AWS
+
+**Ferramentas para Experimentação:**
+- **Jepsen**: Testing distributed systems
+- **FoundationDB**: Simulation testing framework
+- **Maelstrom**: Distributed systems testing toolkit
+- **Chaos engineering**: AWS Fault Injection Simulator
+
+---
+
+**Autor do Capítulo:** AWS Learning Repository Contributors
+
+**Data de Criação:** 2024
+
+**Última Atualização:** Dezembro 2024
+
+---
+
+*Este capítulo fornece uma base sólida em algoritmos de sistemas distribuídos, combinando teoria rigorosa com implementações práticas e exemplos do mundo real. Os conceitos aqui apresentados são fundamentais para projetar, implementar e operar sistemas distribuídos robustos e escaláveis na AWS e outras plataformas de cloud computing.*
+
