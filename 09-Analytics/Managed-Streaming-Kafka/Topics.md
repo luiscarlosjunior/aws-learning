@@ -699,11 +699,324 @@ Você pode literalmente apontar para os diagramas e dizer:
 * “Aqui está como mitigamos”
 * “Aqui está como evoluímos sem reescrever tudo”
 
-Se quiser, no próximo passo posso:
 
-* Converter isso em **slides**
-* Gerar uma **documentação Markdown**
-* Criar um **ADR formal com esses diagramas**
+*** 
 
-Esse nível de discussão mostra **arquitetura madura, não dogmática**.
+# Abordagem do producer 
+
+1. Objetivo da POC
+2. Responsabilidades do Producer
+3. Arquitetura lógica do Producer
+4. Estratégia para tópicos e partições
+5. Escala: 1 instância vs múltiplas instâncias
+6. Controle, observabilidade e governança
+7. Fluxograma (Mermaid)
+8. Etapas de implementação
+9. Pontos perigosos e riscos reais
+
+---
+
+# 🎯 1. Objetivo da POC (Producer)
+
+### O que a POC PRECISA provar
+
+A POC do **Producer EC2 .NET** deve responder objetivamente:
+
+* Consigo **publicar corretamente** em múltiplos tópicos?
+* Consigo **controlar a distribuição de mensagens por partição**?
+* Consigo **simular volume realista**?
+* Consigo **escalar horizontalmente sem quebrar nada**?
+* Consigo **medir impacto em latência e custo**?
+
+⚠️ **Importante**:
+A POC **não** precisa:
+
+* Ser altamente resiliente
+* Ter autoscaling perfeito
+* Ter HA completo
+
+Ela precisa **validar decisões arquiteturais**, não ser produção.
+
+---
+
+# 🧱 2. Responsabilidades do Producer
+
+O Producer **não é burro**, mas também **não deve ser inteligente demais**.
+
+### Responsabilidades corretas
+
+✔ Escolher o tópico
+✔ Definir a key de partição
+✔ Garantir confiabilidade (`acks=all`)
+✔ Controlar taxa (throttling)
+✔ Emitir métricas
+
+### Responsabilidades que NÃO são dele
+
+❌ Saber quantas partições existem
+❌ Fazer load balancing manual
+❌ Garantir ordem global
+❌ Saber quem vai consumir
+
+👉 **Kafka já faz isso melhor.**
+
+---
+
+# 🧠 3. Arquitetura lógica do Producer
+
+Pense no Producer como **pipeline**, não como um “serviço REST”.
+
+```
+Input Generator
+     ↓
+Message Builder
+     ↓
+Topic Resolver
+     ↓
+Partition Key Resolver
+     ↓
+Kafka Producer
+     ↓
+Metrics & Logs
+```
+
+---
+
+# 🧩 4. Estratégia para tópicos e partições
+
+## 🔑 Regra de ouro
+
+> **Producer escolhe a KEY, Kafka escolhe a PARTIÇÃO**
+
+### Exemplo
+
+```text
+Topic: mt-c400
+Key: hash(codigo + truck_id)
+```
+
+Kafka:
+
+* Aplica hash(key)
+* Mod N (partições)
+* Distribui automaticamente
+
+⚠️ Você **não** deve usar `partition=X` manualmente na POC.
+
+---
+
+## 🔍 Estratégia de chave (decisão crítica)
+
+### Opções
+
+| Estratégia           | Prós               | Contras        |
+| -------------------- | ------------------ | -------------- |
+| `truck_id`           | Ordem por caminhão | Hot partitions |
+| `codigo`             | Isolamento lógico  | Perda de ordem |
+| `hash(codigo+truck)` | Equilíbrio         | Ordem parcial  |
+
+👉 **Para POC:**
+Use `hash(codigo + truck_id)`
+É a mais defensável.
+
+---
+
+# ⚖️ 5. Escala: quantas instâncias de Producer?
+
+### ❗ Verdade importante
+
+> **Kafka Producer escala melhor por THREAD do que por INSTÂNCIA**
+
+### Estratégia correta para POC
+
+#### Fase 1 – 1 EC2
+
+* 1 processo
+* 1 Producer
+* 5–10 threads
+* Controle de TPS
+
+#### Fase 2 – 2 EC2
+
+* Mesma config
+* Mesmos tópicos
+* Mesmas chaves
+
+👉 Kafka garante que:
+
+* Não há duplicação
+* Não há conflito
+* Não há desordem por key
+
+---
+
+## ⚠️ Erro comum
+
+> “Vou criar um Producer por partição”
+
+❌ ERRADO
+Isso quebra:
+
+* Escala
+* Rebalance
+* Custo
+
+---
+
+# 🎛️ 6. Controle e governança
+
+### Controle de taxa (obrigatório)
+
+```text
+- Mensagens/segundo
+- Bytes/segundo
+```
+
+Implemente:
+
+* Token bucket simples
+* Sleep controlado
+* Config via ENV VAR
+
+---
+
+### Observabilidade mínima
+
+| Métrica     | Por quê        |
+| ----------- | -------------- |
+| msg/s       | Throughput     |
+| ack latency | Saúde MSK      |
+| error rate  | Confiabilidade |
+| retries     | Saturação      |
+
+---
+
+# 🔁 7. Fluxograma do Producer (Mermaid)
+
+```mermaid
+flowchart TD
+    A[Start Producer] --> B[Load Config]
+    B --> C[Initialize Kafka Producer]
+    C --> D[Start Worker Threads]
+
+    D --> E[Generate Payload]
+    E --> F[Resolve Topic]
+    F --> G[Resolve Key]
+    G --> H[Send to Kafka]
+
+    H --> I{Ack OK?}
+    I -->|Yes| J[Emit Metrics]
+    I -->|No| K[Retry / Log Error]
+
+    J --> E
+```
+
+---
+
+# 🛠️ 8. Etapas práticas da POC
+
+## Etapa 1 – Infra mínima
+
+* EC2 t3.medium
+* Security Group liberando MSK
+* Certificados funcionando
+
+---
+
+## Etapa 2 – Código Producer .NET
+
+Componentes:
+
+* `ProducerFactory`
+* `MessageGenerator`
+* `TopicRouter`
+* `KeyResolver`
+* `MetricsEmitter`
+
+---
+
+## Etapa 3 – Simulação de carga
+
+* Ramp-up gradual
+* 1 → 5 → 10 threads
+* Observa latência
+
+---
+
+## Etapa 4 – Scale-out
+
+* Sobe segunda EC2
+* Mesmo código
+* Observa:
+
+  * Distribuição
+  * Throughput
+  * Impacto no MSK
+
+---
+
+# ☠️ 9. Pontos perigosos e riscos reais
+
+## 🔥 Risco 1 – Hot partitions
+
+* Chave mal escolhida
+* Solução: hash composta
+
+---
+
+## 🔥 Risco 2 – Buffer interno do Producer
+
+* `queue.buffering.max.messages`
+* Pode causar OOM
+* Monitorar
+
+---
+
+## 🔥 Risco 3 – Backpressure invisível
+
+* MSK lento
+* Producer continua aceitando
+* Latência explode
+
+---
+
+## 🔥 Risco 4 – Overengineering
+
+* Producer “inteligente demais”
+* Lógica duplicada
+* Difícil de manter
+
+---
+
+## 🔥 Risco 5 – Falta de métricas
+
+> “Sem métricas, você não tem arquitetura, só esperança.”
+
+---
+
+# 🧠 Conclusão arquitetural
+
+> O Producer **não controla o Kafka**.
+> Ele **declara intenção** (key, tópico, confiabilidade).
+> O Kafka **executa a estratégia de escala**.
+
+Essa POC vai te permitir:
+
+* Defender a arquitetura com números
+* Antecipar gargalos
+* Calibrar decisões antes da produção
+
+---
+
+## 🔜 Próximo passo (se quiser)
+
+Posso:
+
+* Criar **pseudocódigo .NET detalhado do Producer**
+* Criar **checklist de POC**
+* Criar **template de relatório de resultados**
+* Avançar para **EC2 Consumer**
+
+Se quiser, diga:
+👉 *“Vamos detalhar o código do Producer”*
 
