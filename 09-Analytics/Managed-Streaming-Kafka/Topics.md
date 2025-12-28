@@ -3997,3 +3997,246 @@ Resposta:
 * Pause/resume evita caos
 * Idempotência é mandatória
 
+Perfeito. Vou unir **arquitetura + pseudocódigo + justificativa técnica**, exatamente no formato que funciona em **documentação, review técnico e discussão com arquitetos/SREs**.
+
+A ideia aqui é **mostrar como o consumer funciona por dentro**, não só o “o quê”, mas o **porquê de cada decisão**.
+
+---
+
+## 🧠 Visão geral do Consumer (o que estamos construindo)
+
+Você terá:
+
+* **Consumer .NET rodando em EC2**
+* Participando de **um único Consumer Group**
+* Consumindo **tópicos com múltiplas partições**
+* Processando mensagens em **batch**
+* Enviando batches para um **Lambda**
+* Fazendo **commit manual de offset**
+* Tratando **erro, retry e DLQ**
+
+---
+
+## 📐 DIAGRAMA ARQUITETURAL + FLUXO LÓGICO (MERMAID)
+
+Esse diagrama mistura **fluxo de execução** com **pseudocódigo conceitual**, para ficar didático.
+
+```mermaid
+flowchart TD
+    A[Start Consumer Service] --> B[Load Configs<br/>group.id, batch size, timeouts]
+    B --> C[Create Kafka Consumer]
+    C --> D[Subscribe to Topics]
+
+    D --> E[Poll Kafka]
+    E -->|No messages| E
+
+    E -->|Messages| F[Group Messages by Partition]
+
+    F --> G[Add to Batch Buffer<br/>per partition]
+
+    G --> H{Batch Ready?<br/>size or timeout}
+
+    H -->|No| E
+    H -->|Yes| I[Invoke Lambda with Batch]
+
+    I --> J{Lambda Success?}
+
+    J -->|Yes| K[Commit Offset<br/>per partition]
+    K --> E
+
+    J -->|Retryable Error| L[Retry with Backoff]
+    L --> I
+
+    J -->|Fatal Error| M[Send Batch to DLQ]
+    M --> K
+
+    E -->|Consumer Slow| N[Pause Partition]
+    N --> E
+```
+
+---
+
+## 🧩 PSEUDOCÓDIGO DO CONSUMER (DETALHADO)
+
+Agora vamos traduzir esse fluxo para **pseudocódigo próximo da realidade em C#**, mas ainda agnóstico de framework.
+
+### 1️⃣ Inicialização
+
+```pseudo
+config = loadConsumerConfig()
+consumer = new KafkaConsumer(config)
+
+consumer.subscribe(topics)
+```
+
+**Justificativa**
+Aqui definimos:
+
+* `group.id` fixo → escala horizontal
+* `enable.auto.commit = false` → controle total
+* `max.poll.records` → limite de batch
+
+---
+
+### 2️⃣ Loop principal de consumo
+
+```pseudo
+while (serviceIsRunning):
+
+    records = consumer.poll(timeout)
+
+    if records.isEmpty:
+        continue
+```
+
+**Por que isso importa**
+O `poll`:
+
+* mantém heartbeat com Kafka
+* evita rebalance desnecessário
+* é o ponto de entrada de dados
+
+---
+
+### 3️⃣ Organização por partição (conceito-chave)
+
+```pseudo
+for each record in records:
+    partitionBuffer[record.partition].add(record)
+```
+
+**Justificativa arquitetural**
+
+* Kafka **garante ordem por partição**
+* Misturar partições no mesmo batch pode quebrar essa garantia
+* Offset é sempre por partição
+
+👉 **Batch sempre respeita partição**
+
+---
+
+### 4️⃣ Controle de batch (tamanho ou tempo)
+
+```pseudo
+for each partition in partitionBuffer:
+    if batchSizeReached(partition) OR batchTimeoutReached(partition):
+        processBatch(partition)
+```
+
+**Por que não enviar mensagem a mensagem?**
+
+* Reduz custo de Lambda
+* Reduz latência acumulada
+* Evita throttling
+
+---
+
+### 5️⃣ Chamada ao Lambda
+
+```pseudo
+function processBatch(partition):
+
+    response = invokeLambdaAsync(batch)
+
+    if response.success:
+        commitOffset(partition)
+    else if response.retryable:
+        retryWithBackoff(batch)
+    else:
+        sendToDLQ(batch)
+        commitOffset(partition)
+```
+
+---
+
+## 🔑 JUSTIFICATIVAS DAS ESCOLHAS (PARTE MAIS IMPORTANTE)
+
+### ✅ Por que **commit manual**?
+
+Porque o fluxo real é:
+
+> Kafka → Consumer → Lambda → sucesso
+
+Se você commitar antes do Lambda responder:
+
+* você **perde mensagens**
+* não há rollback
+* incidente silencioso
+
+Commit manual garante:
+
+* **at-least-once**
+* controle de erro
+* retry seguro
+
+---
+
+### ✅ Por que **batch antes do Lambda**?
+
+Sem batch:
+
+* 13k invocations/s
+* custo absurdo
+* throttling
+* latência imprevisível
+
+Com batch:
+
+* invocações previsíveis
+* custo controlado
+* throughput estável
+
+---
+
+### ✅ Por que **um Consumer Group único**?
+
+Porque:
+
+* Kafka escala consumo por group
+* Group define domínio lógico
+* Offset pertence ao group
+
+Múltiplos groups:
+
+* duplicam consumo
+* duplicam custo
+* quebram semântica
+
+---
+
+### ✅ Por que **pause / resume**?
+
+```pseudo
+if lambdaIsSlow:
+    consumer.pause(partition)
+
+if lambdaRecovered:
+    consumer.resume(partition)
+```
+
+Isso evita:
+
+* rebalance desnecessário
+* backlog descontrolado
+* queda em cascata
+
+---
+
+## 🧠 COMO EXPLICAR ISSO PARA UM ARQUITETO OU SRE
+
+Frase forte (use essa):
+
+> “O consumer não é apenas um leitor Kafka; ele é um orquestrador de fluxo entre Kafka e Lambda, responsável por preservar ordem, controlar custo e garantir confiabilidade.”
+
+---
+
+## 📌 RESUMO FINAL (PARA DOCUMENTAÇÃO)
+
+* Consumer Group = unidade de escala
+* Partição = unidade de paralelismo
+* Batch = controle de custo
+* Commit manual = confiabilidade
+* DLQ = estabilidade
+* Pause/Resume = resiliência
+
+---
