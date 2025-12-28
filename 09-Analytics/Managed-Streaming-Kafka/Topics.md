@@ -1495,4 +1495,1536 @@ Critério de sucesso:
 
 > “Aumentar partições é uma operação planejada, previsível e segura quando o Producer é key-based, os Consumers são idempotentes e o impacto é monitorado. O risco não está no Kafka, está em arquiteturas que acoplam código à topologia.”
 
+Perfeito. Vou estruturar **um playbook completo para o CONSUMER (.NET em EC2)**, já alinhado com tudo o que discutimos: MSK gerenciado, múltiplos tópicos, múltiplas partições, possibilidade de aumento de partições no futuro, batching e integração com Lambda.
 
+Vou escrever isso no **nível de documentação técnica + operacional**, do jeito que um **SRE, arquiteto ou tech lead espera ler**.
+
+---
+
+# 📘 Playbook do Consumer Kafka (.NET + EC2 + MSK)
+
+## 1. Papel do Consumer na Arquitetura
+
+O **consumer** é o componente mais crítico da arquitetura porque ele:
+
+* Converte **throughput Kafka → processamento real**
+* Define **latência**, **ordenação**, **paralelismo**
+* É o ponto onde **backpressure aparece**
+* É onde falhas viram **reprocessamento, duplicação ou perda**
+
+Na sua arquitetura, o consumer:
+
+* Consome tópicos como `mt-c400`
+* Lê **N partições em paralelo**
+* Agrega mensagens em **lotes**
+* Dispara **Lambda** quando:
+
+  * Batch size atingido **OU**
+  * Timeout atingido
+
+---
+
+## 2. Princípios de Design (não negociáveis)
+
+### 2.1 Consumer Group é obrigatório
+
+> **Escalabilidade em Kafka = consumer group**
+
+* Cada instância EC2 do consumer:
+
+  * Usa o **mesmo `group.id`**
+* Kafka garante:
+
+  * **1 partição → 1 consumer ativo**
+  * Rebalance automático
+
+👉 Se você tem **12 partições**, o máximo de paralelismo real é **12 consumers ativos**.
+
+---
+
+### 2.2 Consumer NÃO decide partição
+
+> Diferente do producer, o consumer **não escolhe partições**
+
+Ele:
+
+* Recebe partições atribuídas pelo **Kafka Group Coordinator**
+* Deve ser **agnóstico** à quantidade de partições
+
+Isso é essencial para:
+
+* Suportar **aumento futuro de partições**
+* Evitar reescrita do código
+
+---
+
+## 3. Estratégia de Escala do Consumer
+
+### 3.1 Relação Partições x Instâncias
+
+| Partições | EC2 Consumers | Resultado                    |
+| --------- | ------------- | ---------------------------- |
+| 6         | 3             | Cada EC2 consome 2 partições |
+| 6         | 6             | 1 partição por EC2           |
+| 6         | 10            | 4 EC2 ficam ociosos          |
+| 12        | 6             | Cada EC2 consome 2 partições |
+
+👉 **Nunca escale EC2 sem considerar partições**
+👉 Escalar além do número de partições **não aumenta throughput**
+
+---
+
+### 3.2 Modelo recomendado
+
+* **Auto Scaling Group (ASG)**
+* Métricas:
+
+  * Lag por consumer group
+  * CPU / memória
+* Escala:
+
+  * Scale out **até o limite de partições**
+  * Depois disso → só aumenta custo
+
+---
+
+## 4. Fluxo Lógico do Consumer
+
+### 4.1 Fluxo macro
+
+1. EC2 sobe
+2. Inicializa Kafka Consumer
+3. Entra no Consumer Group
+4. Kafka atribui partições
+5. Loop de consumo:
+
+   * Poll mensagens
+   * Bufferiza
+   * Dispara Lambda
+   * Commita offsets
+
+---
+
+### 4.2 Fluxograma (mental)
+
+```
+START
+ ↓
+Connect to MSK (mTLS)
+ ↓
+Join Consumer Group
+ ↓
+Get Assigned Partitions
+ ↓
+WHILE running:
+    Poll messages
+    Add to batch
+    IF batch size OR timeout:
+        Call Lambda
+        Commit offsets
+```
+
+---
+
+## 5. Estratégia de Batching (fundamental)
+
+### 5.1 Por que batching?
+
+Sem batching:
+
+* Milhares de invocações Lambda
+* Custo alto
+* Latência variável
+
+Com batching:
+
+* Controle de custo
+* Throughput previsível
+* Melhor uso de rede
+
+---
+
+### 5.2 Tipos de batching
+
+Você **DEVE** usar dois gatilhos:
+
+1. **Batch Size**
+
+   * Ex: 500 mensagens
+2. **Batch Timeout**
+
+   * Ex: 1 segundo
+
+> Nunca use apenas tamanho — isso causa latência infinita em períodos de baixo tráfego
+
+---
+
+## 6. Commit de Offset (ponto crítico)
+
+### 6.1 Estratégia correta
+
+* `EnableAutoCommit = false`
+* Commit **após Lambda responder OK**
+
+```csharp
+consumer.Commit();
+```
+
+---
+
+### 6.2 Riscos
+
+| Situação                | Impacto             |
+| ----------------------- | ------------------- |
+| Commit antes do Lambda  | Perda de dados      |
+| Commit depois do Lambda | Possível duplicação |
+| Lambda falha            | Reprocessamento     |
+
+👉 **Kafka trabalha com “at-least-once”**
+👉 Duplicação é aceitável, perda não
+
+---
+
+## 7. Integração com Lambda
+
+### 7.1 Modelo recomendado
+
+* Consumer chama Lambda **sincronamente**
+* Payload contém:
+
+  * Lista de mensagens
+  * Metadados (topic, partition, offset)
+
+```json
+{
+  "topic": "mt-c400",
+  "partition": 3,
+  "messages": [...]
+}
+```
+
+---
+
+### 7.2 Por que não assíncrono?
+
+* Você perde controle de sucesso/falha
+* Não sabe quando commitar offsets
+* Quebra consistência
+
+---
+
+## 8. Impacto do Aumento de Partições no Consumer
+
+### 8.1 O que acontece tecnicamente?
+
+Quando você aumenta partições:
+
+1. Kafka dispara **rebalance**
+2. Consumers pausam
+3. Partições são redistribuídas
+4. Consumo continua
+
+---
+
+### 8.2 Impactos práticos
+
+| Impacto    | Explicação              |
+| ---------- | ----------------------- |
+| Rebalance  | Pausa temporária        |
+| Ordem      | Ordem global quebra     |
+| Throughput | Aumenta potencial       |
+| Código     | Não muda (se bem feito) |
+
+👉 **Consumer bem feito não precisa mudar uma linha**
+
+---
+
+## 9. Pontos de Atenção (riscos reais)
+
+### 9.1 Rebalance frequente
+
+Causas:
+
+* Muitas instâncias subindo/descendo
+* Timeout mal configurado
+
+Mitigação:
+
+* Ajustar:
+
+  * `session.timeout.ms`
+  * `max.poll.interval.ms`
+
+---
+
+### 9.2 Backpressure
+
+Se Lambda ficar lenta:
+
+* Batch cresce
+* Lag aumenta
+* ASG tenta escalar
+
+Mitigação:
+
+* Timeout de Lambda
+* Circuit breaker
+* Limite de batch
+
+---
+
+### 9.3 Lag invisível
+
+Se você não monitora:
+
+* O sistema “parece vivo”
+* Mas está horas atrasado
+
+Obrigatório:
+
+* Monitorar **Consumer Group Lag**
+
+---
+
+## 10. Perguntas duras que vão surgir (e respostas)
+
+### ❓ “E se dobrar o volume em 6 meses?”
+
+✔️ Resposta:
+
+> Aumentamos partições, o consumer absorve automaticamente via rebalance. O código já está preparado.
+
+---
+
+### ❓ “E se uma EC2 cair?”
+
+✔️ Resposta:
+
+> Kafka redistribui partições para os outros consumers automaticamente.
+
+---
+
+### ❓ “Por que não Lambda direto consumindo Kafka?”
+
+✔️ Resposta:
+
+> Lambda não é ideal para:
+
+* Long-lived connections
+* Alto throughput contínuo
+* Controle fino de offset
+
+---
+
+## 11. Checklist de POC – Consumer
+
+### Código
+
+* [ ] Consumer Group configurado
+* [ ] Commit manual
+* [ ] Batch size + timeout
+* [ ] Logs estruturados
+
+### Infra
+
+* [ ] ASG configurado
+* [ ] IAM para Lambda invoke
+* [ ] Certificados mTLS
+
+### Observabilidade
+
+* [ ] Lag por consumer group
+* [ ] Tempo de batch
+* [ ] Erros de Lambda
+
+---
+
+## 12. Conclusão (frase de arquiteto)
+
+> **O consumer é o elemento que transforma paralelismo do Kafka em capacidade real de processamento.**
+> Se ele for stateless, idempotente e orientado a consumer groups, a arquitetura escala horizontalmente sem reescrita, mesmo com aumento de partições ao longo do tempo.
+
+---
+
+Perfeito. Abaixo está **um diagrama Mermaid focado exclusivamente no CONSUMER (.NET em EC2)**, cobrindo:
+
+* Consumer Group
+* Atribuição de partições
+* Batching
+* Commit de offset
+* Chamada ao Lambda
+* Rebalance
+* Observabilidade
+
+Você pode colar isso **diretamente no draw.io (diagrams.net)** ou em qualquer editor que suporte Mermaid.
+
+---
+
+## 📊 Diagrama Mermaid — Consumer Kafka (.NET + EC2)
+
+```mermaid
+flowchart TD
+    subgraph MSK["Amazon MSK (Kafka Cluster)"]
+        T1["Tópico: mt-c400"]
+        P0["Partição 0"]
+        P1["Partição 1"]
+        P2["Partição 2"]
+        Pn["Partição N"]
+
+        T1 --> P0
+        T1 --> P1
+        T1 --> P2
+        T1 --> Pn
+    end
+
+    subgraph CG["Consumer Group: mt-c400-consumer-group"]
+        C1["EC2 Consumer #1 (.NET)"]
+        C2["EC2 Consumer #2 (.NET)"]
+        C3["EC2 Consumer #3 (.NET)"]
+    end
+
+    P0 -->|Assign| C1
+    P1 -->|Assign| C2
+    P2 -->|Assign| C3
+    Pn -->|Assign| C1
+
+    subgraph C1_FLOW["Fluxo Interno do Consumer"]
+        POLL["Poll() Kafka"]
+        BUFFER["Buffer de Mensagens"]
+        CHECK{"Batch Size<br/>ou Timeout?"}
+        INVOKE["Invoke Lambda<br/>(Sync)"]
+        COMMIT["Commit Offset"]
+    end
+
+    C1 --> POLL
+    POLL --> BUFFER
+    BUFFER --> CHECK
+    CHECK -- Não --> POLL
+    CHECK -- Sim --> INVOKE
+    INVOKE -->|OK| COMMIT
+    COMMIT --> POLL
+
+    INVOKE -->|Erro| DLQ["Retry / DLQ / Backoff"]
+
+    subgraph OBS["Observabilidade"]
+        LAG["Consumer Group Lag"]
+        METRICS["CPU / Memória"]
+        LOGS["Logs Estruturados"]
+    end
+
+    C1 --> LAG
+    C2 --> LAG
+    C3 --> LAG
+
+    C1 --> METRICS
+    C2 --> METRICS
+    C3 --> METRICS
+
+    C1 --> LOGS
+    C2 --> LOGS
+    C3 --> LOGS
+
+    subgraph REBALANCE["Evento de Rebalance"]
+        SCALE["Scale Out / In EC2"]
+        REDIST["Redistribuição de Partições"]
+    end
+
+    SCALE --> REDIST
+    REDIST --> C1
+    REDIST --> C2
+    REDIST --> C3
+```
+
+---
+
+## 🧠 Como interpretar esse diagrama (para explicar aos pares)
+
+### 1️⃣ MSK e Partições
+
+* O tópico `mt-c400` é dividido em **N partições**
+* Kafka garante **ordem por partição**
+
+---
+
+### 2️⃣ Consumer Group
+
+* Todas as EC2 usam o **mesmo group.id**
+* Kafka atribui partições dinamicamente
+* **1 partição → 1 consumer ativo**
+
+---
+
+### 3️⃣ Fluxo interno do Consumer
+
+* `Poll()` lê mensagens
+* Mensagens vão para buffer
+* Quando:
+
+  * Batch size **OU**
+  * Timeout
+    → Lambda é invocado
+
+---
+
+### 4️⃣ Commit de Offset
+
+* Só ocorre **após Lambda responder OK**
+* Garante **at-least-once**
+
+---
+
+### 5️⃣ Rebalance
+
+* Acontece quando:
+
+  * Nova EC2 sobe
+  * EC2 cai
+  * Partições aumentam
+* Kafka redistribui automaticamente
+
+---
+
+### 6️⃣ Observabilidade
+
+* **Lag** é o principal KPI
+* CPU/Memória mostram saturação
+* Logs ajudam a diagnosticar rebalance e falhas
+
+---
+
+## 🎯 Mensagem-chave para a documentação
+
+> O consumer é stateless, orientado a consumer group e desacoplado do número de partições.
+> Isso permite escalar horizontalmente, absorver aumento de partições e manter confiabilidade sem mudanças de código.
+
+Excelente pedido — **Consumer Group é o coração da sua arquitetura** e normalmente é onde arquitetos, SREs e seniors mais questionam.
+Vou fazer em **três níveis**:
+
+1. **Explicação conceitual profunda (o “porquê”)**
+2. **Como isso se traduz na sua aplicação .NET em EC2**
+3. **Diagrama Mermaid didático para documentação e apresentação**
+
+---
+
+# 1️⃣ O que é um Consumer Group (conceito profundo)
+
+Um **Consumer Group** no Kafka é um **mecanismo de coordenação distribuída** que resolve **três problemas fundamentais**:
+
+---
+
+## 🔹 Problema 1 – Escalabilidade horizontal
+
+Sem consumer group:
+
+* Um consumer lê tudo
+* Limite físico de CPU / rede
+
+Com consumer group:
+
+* Várias instâncias leem **em paralelo**
+* Kafka distribui as **partições** entre elas
+
+> 📌 **Regra de ouro**
+>
+> * 1 partição → **somente 1 consumer ativo**
+> * 1 consumer → **pode ler várias partições**
+
+---
+
+## 🔹 Problema 2 – Garantia de ordem
+
+Kafka **não garante ordem global**, apenas:
+
+> **Ordem dentro da mesma partição**
+
+O consumer group **preserva essa garantia**, porque:
+
+* Uma partição nunca é processada por dois consumers ao mesmo tempo
+* Logo, a sequência de mensagens é mantida
+
+---
+
+## 🔹 Problema 3 – Tolerância a falhas
+
+Se um consumer cai:
+
+* Kafka detecta falha via **heartbeat**
+* Redistribui as partições automaticamente
+* Outro consumer assume
+
+> Isso é **self-healing**, sem intervenção humana.
+
+---
+
+# 2️⃣ Como funciona internamente (mecanismo real)
+
+### Componentes envolvidos:
+
+| Componente               | Função                              |
+| ------------------------ | ----------------------------------- |
+| **Group Coordinator**    | Broker Kafka responsável pelo grupo |
+| **Heartbeat**            | Sinal periódico de vida do consumer |
+| **Partition Assignment** | Algoritmo de distribuição           |
+| **Offsets**              | Posição de leitura por partição     |
+
+---
+
+## 🔄 Ciclo de vida de um Consumer Group
+
+1. Consumer inicia
+2. Envia `JoinGroup`
+3. Recebe partições
+4. Começa a consumir
+5. Envia heartbeats
+6. Commit de offsets
+7. Continua até morrer ou escalar
+
+---
+
+## ⚠️ Rebalance (ponto crítico)
+
+Rebalance ocorre quando:
+
+* Nova EC2 sobe
+* EC2 cai
+* Partições aumentam
+* Consumer fica lento
+
+Durante o rebalance:
+
+* Consumo **pausa**
+* Partições são redistribuídas
+* Offsets são reatribuídos
+
+> ⚠️ Quanto mais partições e mais consumers, mais caro o rebalance.
+
+---
+
+# 3️⃣ Por que sua aplicação PRECISA definir um Consumer Group
+
+Na sua arquitetura:
+
+* EC2 Consumer é **stateless**
+* Lambda recebe batches
+* Kafka mantém estado (offsets)
+
+👉 **O estado não está na aplicação, está no Kafka**
+
+### Isso permite:
+
+* Escalar EC2 sem reconfiguração
+* Substituir instâncias sem perda
+* Deploy seguro (rolling update)
+
+---
+
+## 🔐 group.id = contrato operacional
+
+O `group.id` define:
+
+* Quem divide carga
+* Quem compete pelas mensagens
+* Quem mantém offset
+
+> Se mudar o `group.id`, Kafka entende como **aplicação nova**
+
+---
+
+# 4️⃣ Consumer Group no contexto .NET + MSK
+
+### Configuração típica (.NET)
+
+```csharp
+var config = new ConsumerConfig
+{
+    BootstrapServers = "...",
+    GroupId = "mt-c400-consumer-group",
+    EnableAutoCommit = false,
+    AutoOffsetReset = AutoOffsetReset.Earliest,
+    MaxPollIntervalMs = 300000,
+    SessionTimeoutMs = 45000
+};
+```
+
+### O que isso significa arquiteturalmente
+
+| Config                   | Impacto                            |
+| ------------------------ | ---------------------------------- |
+| `GroupId`                | Define cluster lógico de consumers |
+| `EnableAutoCommit=false` | Controle transacional              |
+| `MaxPollIntervalMs`      | Protege contra consumer lento      |
+| `SessionTimeoutMs`       | Define sensibilidade a falhas      |
+
+---
+
+# 5️⃣ Consumer Group ≠ Tópico ≠ Aplicação
+
+Essa confusão é comum:
+
+| Conceito           | Significado                      |
+| ------------------ | -------------------------------- |
+| **Tópico**         | Fluxo de dados                   |
+| **Consumer Group** | Cluster lógico de leitura        |
+| **Consumer**       | Instância física                 |
+| **Aplicação**      | Código que implementa o consumer |
+
+---
+
+# 6️⃣ Diagrama Mermaid — Consumer Group em detalhes
+
+```mermaid
+flowchart LR
+    subgraph Kafka["Amazon MSK (Kafka)"]
+        T["Tópico: mt-c400"]
+        P0["Partição 0"]
+        P1["Partição 1"]
+        P2["Partição 2"]
+        P3["Partição 3"]
+
+        T --> P0
+        T --> P1
+        T --> P2
+        T --> P3
+    end
+
+    subgraph CG["Consumer Group: mt-c400-consumer-group"]
+        C1["Consumer EC2 #1"]
+        C2["Consumer EC2 #2"]
+        C3["Consumer EC2 #3"]
+    end
+
+    P0 -->|assign| C1
+    P1 -->|assign| C2
+    P2 -->|assign| C3
+    P3 -->|assign| C1
+
+    C1 -->|heartbeat| Kafka
+    C2 -->|heartbeat| Kafka
+    C3 -->|heartbeat| Kafka
+
+    C1 -->|commit offset| Kafka
+    C2 -->|commit offset| Kafka
+    C3 -->|commit offset| Kafka
+
+    subgraph Rebalance["Rebalance Event"]
+        SCALE["Scale Out / Failure"]
+        REDIST["Reatribuição de Partições"]
+    end
+
+    SCALE --> REDIST
+    REDIST --> CG
+```
+
+---
+
+# 7️⃣ Argumento forte para convencer superiores
+
+> O Consumer Group transforma múltiplas instâncias EC2 em **um único consumidor lógico**, com:
+>
+> * Escalabilidade horizontal
+> * Tolerância a falhas
+> * Preservação de ordem
+> * Controle de estado centralizado
+>
+> Sem ele, a arquitetura seria rígida, frágil e cara.
+
+---
+
+# 8️⃣ Riscos e cuidados (pontos que seniors vão perguntar)
+
+| Risco               | Mitigação                     |
+| ------------------- | ----------------------------- |
+| Rebalance frequente | Menos consumers que partições |
+| Consumer lento      | Batching + async              |
+| Lag alto            | Auto scaling                  |
+| Lambda lento        | Backpressure                  |
+| Commit incorreto    | Manual commit                 |
+
+---
+
+## ✅ Frase de encerramento para a documentação
+
+> O Consumer Group é o mecanismo que permite escalar consumo, garantir ordem e tolerar falhas sem adicionar estado ou complexidade ao serviço.
+
+---
+
+## 👿 Principal Engineer (abre a reunião)
+
+> **“Vamos direto ao ponto. Me explique por que essa arquitetura não vai virar um pesadelo operacional em seis meses.”**
+
+### ✅ Sua resposta (calma, técnica):
+
+> Porque ela se apoia em primitivas maduras do Kafka:
+>
+> * consumer group para coordenação
+> * partições como unidade de paralelismo
+> * estado externo (offsets)
+>
+> Não criamos lógica distribuída customizada. Delegamos complexidade ao Kafka, que já resolve isso há anos.
+
+---
+
+## 👿 SRE (já atacando)
+
+> **“Rebalance. Toda vez que eu escuto essa palavra, alguém está escondendo downtime. Quanto tempo seu sistema fica parado?”**
+
+### ✅ Resposta certa (sem mentir):
+
+> O consumo pausa durante o rebalance, sim.
+>
+> Mas:
+>
+> * não perdemos mensagens
+> * o backlog é absorvido pelas partições
+> * usamos batch para amortecer
+>
+> É um pause controlado, não downtime funcional.
+
+> E evitamos rebalance frequente controlando autoscaling.
+
+---
+
+## 👿 SRE (mais agressivo)
+
+> **“Quantos rebalances você espera por dia?”**
+
+### ❌ Resposta errada:
+
+> “Depende…”
+
+### ✅ Resposta correta:
+
+> Em steady state: zero.
+>
+> Apenas em:
+>
+> * deploy
+> * falha de instância
+> * scaling manual ou automatizado
+>
+> Não é um evento de runtime normal.
+
+---
+
+## 👿 Principal Engineer (olhando o desenho)
+
+> **“Você tem 40 partições e 10 consumers. Por quê?”**
+
+### ✅ Resposta forte:
+
+> Porque partições são capacidade futura.
+>
+> Consumers são capacidade atual.
+>
+> Partições a mais:
+>
+> * reduzem impacto de scaling
+> * evitam redistribuição estrutural
+> * permitem crescimento sem mudança de MSK
+
+---
+
+## 👿 FinOps (entra pesado)
+
+> **“Você está criando EC2 só para chamar Lambda. Isso é burrice ou luxo?”**
+
+😐 silêncio na call…
+
+### ✅ Resposta que salva:
+
+> Lambda não é um bom consumer Kafka com mTLS e controle fino de batch.
+>
+> EC2:
+>
+> * controla backpressure
+> * controla commit
+> * reduz invocações Lambda via batch
+>
+> No fim, reduz custo total e risco operacional.
+
+---
+
+## 👿 FinOps (pressionando)
+
+> **“Quanto custa esse batch?”**
+
+### ✅ Resposta madura:
+
+> Batch é uma decisão econômica e técnica.
+>
+> Menos invocações Lambda
+> Menos custo por request
+> Melhor uso de CPU
+>
+> O batch é parametrizável e monitorado via latency e lag.
+
+---
+
+## 👿 Principal Engineer (ataque clássico)
+
+> **“Por que não um tópico só? Vocês estão complicando demais.”**
+
+### ❌ Resposta fraca:
+
+> “Porque é melhor…”
+
+### ✅ Resposta correta:
+
+> Um tópico único mistura domínios, prioridades e ritmos.
+>
+> Isso gera:
+>
+> * vizinho barulhento
+> * desperdício de CPU
+> * blast radius alto
+>
+> Preferimos isolamento lógico para preservar estabilidade.
+
+---
+
+## 👿 SRE (cutucando ferida)
+
+> **“E se um consumer ficar lento?”**
+
+### ✅ Resposta certa:
+
+> Kafka para de aceitar heartbeat.
+>
+> Dispara rebalance.
+>
+> Outro consumer assume.
+>
+> Offset só avança se o Lambda responder OK.
+
+---
+
+## 👿 SRE (quase gritando)
+
+> **“E SE O LAMBDA FICAR LENTO?”**
+
+### ✅ Resposta que demonstra senioridade:
+
+> O consumer aplica backpressure automaticamente.
+>
+> Lag sobe.
+>
+> Observabilidade detecta.
+>
+> Scaling ou mitigação é acionada.
+>
+> Nenhuma mensagem é perdida.
+
+---
+
+## 👿 Principal Engineer (olhar mortal)
+
+> **“O que quebra quando você aumenta partições?”**
+
+### ✅ Resposta honesta (não tente esconder):
+
+> A ordenação por chave é afetada.
+>
+> Por isso:
+>
+> * fazemos isso de forma controlada
+> * temos playbook
+> * só aumentamos quando o ganho supera esse impacto
+>
+> É um trade-off consciente.
+
+---
+
+## 👿 Principal Engineer (final)
+
+> **“Qual é o maior risco dessa arquitetura?”**
+
+### ❌ Resposta errada:
+
+> “Não tem.”
+
+### ✅ Resposta correta:
+
+> Rebalance excessivo e downstream imprevisível.
+>
+> Ambos são mitigados com:
+>
+> * observabilidade
+> * batch
+> * controle de scaling
+>
+> São riscos conhecidos, não surpresas.
+
+---
+
+## 👿 Pergunta final (silêncio total)
+
+> **“Se isso der errado, quem vai acordar às 3 da manhã?”**
+
+### ✅ Resposta de quem passa:
+
+> A arquitetura foi pensada para que falhas sejam eventos normais e observáveis.
+>
+> O sistema degrada com lag, não com perda.
+>
+> Se alguém acordar às 3 da manhã, será para escalar, não para apagar incêndio.
+
+---
+
+# 🏁 Resultado da reunião
+
+👉 **Aprovado com ressalvas**
+👉 Pedido de:
+
+* métricas claras de lag
+* limites de batch
+* playbook de rebalance
+* simulação em POC
+
+---
+
+## 🎯 Dica final (importante)
+
+Em review hostil, **não tente vender perfeição**.
+Venda:
+
+* trade-offs conscientes
+* riscos conhecidos
+* mecanismos de mitigação
+
+Isso é o que diferencia **arquiteto experiente** de “desenhista de diagrama”.
+
+---
+
+# 📄 POST-MORTEM TÉCNICO
+
+**Incidente:** Aumento de Lag e Atraso no Processamento
+**Sistema:** MSK + Consumer Group (.NET EC2) + Lambda
+**Severidade:** SEV-2
+**Duração:** 47 minutos
+**Impacto:** Atraso no processamento downstream (sem perda de dados)
+
+---
+
+## 1️⃣ Resumo Executivo
+
+Entre **10:13 e 11:00**, o sistema apresentou um aumento significativo de **consumer lag** no tópico `mt-c400`, atingindo um pico de **~1,2 milhão de mensagens pendentes**.
+
+Nenhuma mensagem foi perdida.
+O sistema se recuperou automaticamente após mitigação operacional.
+
+O incidente expôs **limitações conhecidas da arquitetura**, que estavam documentadas como trade-offs aceitáveis.
+
+---
+
+## 2️⃣ Linha do Tempo (Timeline)
+
+| Horário | Evento                               |
+| ------- | ------------------------------------ |
+| 10:13   | Deploy de nova versão do consumer    |
+| 10:14   | Início de rebalance                  |
+| 10:15   | Lambda começa a responder mais lento |
+| 10:18   | Lag cresce rapidamente               |
+| 10:25   | Alerta de lag > threshold            |
+| 10:30   | Autoscaling acionado                 |
+| 10:42   | Rebalance completo                   |
+| 11:00   | Lag normalizado                      |
+
+---
+
+## 3️⃣ Impacto ao Negócio
+
+* ❌ **Nenhuma perda de dados**
+* ⚠️ Atraso de até **8 minutos** no processamento downstream
+* ✅ Eventos críticos continuaram sendo ingeridos
+* ❌ SLA de latência temporariamente violado
+
+---
+
+## 4️⃣ O que aconteceu (Análise Técnica Profunda)
+
+### 🔹 4.1 Rebalance em cascata
+
+Durante o deploy:
+
+* 3 instâncias EC2 foram reiniciadas
+* Kafka detectou perda de heartbeat
+* Rebalance foi disparado
+
+⚠️ **Importante:**
+O rebalance pausou temporariamente o consumo **por design**.
+
+---
+
+### 🔹 4.2 Lambda como gargalo downstream
+
+Durante o rebalance:
+
+* Batch acumulou mensagens
+* Lambda começou a responder mais lentamente
+* Tempo médio de resposta subiu de 120ms → 950ms
+
+Isso causou:
+
+* Atraso no commit de offsets
+* Lag crescente
+
+---
+
+### 🔹 4.3 Por que o sistema não quebrou?
+
+Porque:
+
+* Commit era manual
+* Offsets não avançaram incorretamente
+* Kafka reteve mensagens
+* Consumer Group garantiu reassignment correto
+
+👉 **At-least-once garantido**
+
+---
+
+## 5️⃣ O que NÃO aconteceu (mitos comuns)
+
+| Medo comum                        | O que realmente aconteceu                |
+| --------------------------------- | ---------------------------------------- |
+| “Perdemos mensagens”              | ❌ Kafka reteve tudo                      |
+| “Consumers processaram duplicado” | ⚠️ Pequena duplicação aceitável          |
+| “Sistema caiu”                    | ❌ Sistema degradou                       |
+| “Precisamos refatorar tudo”       | ❌ Arquitetura se comportou como esperado |
+
+---
+
+## 6️⃣ Root Cause (Causa Raiz)
+
+> **Causa primária:**
+> Rebalance simultâneo + aumento inesperado de latência do Lambda.
+
+> **Causa secundária:**
+> Deploy sem estratégia de rolling update com limitação de instâncias simultâneas.
+
+---
+
+## 7️⃣ Decisões Arquiteturais que se provaram corretas
+
+### ✅ Consumer Group
+
+* Redistribuição automática
+* Nenhuma intervenção manual
+* Recuperação automática
+
+### ✅ Batch controlado
+
+* Reduziu custo Lambda
+* Amorteceu pico de lag
+
+### ✅ Commit manual
+
+* Nenhuma perda
+* Nenhum offset corrompido
+
+---
+
+## 8️⃣ Trade-offs que se manifestaram (e eram conhecidos)
+
+### ⚠️ Rebalance pausa consumo
+
+* Documentado
+* Esperado
+* Impacto temporário
+
+### ⚠️ Dependência de downstream
+
+* Lambda lento impacta lag
+* Mitigado por backpressure
+
+---
+
+## 9️⃣ O que poderia ter sido pior (e não foi)
+
+* ❌ Commit automático → perda de mensagens
+* ❌ Lambda direto no MSK → falhas imprevisíveis
+* ❌ Estado no consumer → recuperação manual
+
+---
+
+## 10️⃣ Ações Corretivas (Action Items)
+
+### 🛠️ Curto Prazo
+
+* Limitar deploy a 1 EC2 por vez
+* Aumentar timeout do Lambda
+* Ajustar batch size dinâmico
+
+### 🛠️ Médio Prazo
+
+* Separar tópicos por prioridade
+* Criar Lambda dedicado para eventos críticos
+* Ajustar autoscaling por lag
+
+### 🛠️ Longo Prazo
+
+* Consumer dedicado para high-priority
+* Circuit breaker no downstream
+* Teste de caos (rebalance forçado)
+
+---
+
+## 11️⃣ Lições Aprendidas (o ponto mais importante)
+
+> A arquitetura **não falhou**.
+> Ela **degradou de forma previsível**.
+
+Isso é exatamente o comportamento esperado em sistemas distribuídos maduros.
+
+---
+
+## 12️⃣ Perguntas difíceis que surgiram no post-mortem
+
+### ❓ “Isso vai acontecer de novo?”
+
+> Sim. Rebalances são inevitáveis.
+
+### ❓ “Podemos evitar totalmente?”
+
+> Não, mas podemos **reduzir frequência e impacto**.
+
+### ❓ “Vale a pena essa complexidade?”
+
+> Sim, porque o custo de não tê-la é perda de dados ou indisponibilidade total.
+
+---
+
+## 13️⃣ Diagrama Mermaid — Incidente e Recuperação
+
+```mermaid
+sequenceDiagram
+    participant EC2 as Consumer EC2
+    participant Kafka as MSK
+    participant Lambda as Lambda
+    participant SRE as SRE
+
+    EC2->>Kafka: Poll()
+    Kafka-->>EC2: Mensagens
+    EC2->>Lambda: Invoke(batch)
+    Lambda-->>EC2: Latência ↑
+    EC2--xKafka: Commit atrasado
+    Kafka->>Kafka: Lag cresce
+    SRE->>EC2: Escala consumidores
+    Kafka->>EC2: Rebalance
+    EC2->>Kafka: Consumo retomado
+    EC2->>Lambda: Processamento normal
+```
+
+---
+
+## 14️⃣ Frase final para fechar o post-mortem
+
+> Em sistemas distribuídos, falha não é exceção — é estado transitório.
+> O sucesso está em **detectar, absorver e recuperar**, não em fingir que não vai acontecer.
+
+Perfeito.
+Abaixo está **uma explicação EXTREMAMENTE detalhada**, acompanhada de **diagramas Mermaid grandes**, cobrindo **exatamente o que você tem que fazer**, **como**, **por quê** e **como tudo se conecta**, respeitando **todas as restrições**:
+
+* MSK em **outra conta**
+* Sem acesso administrativo ao cluster
+* Apenas **criação/configuração de tópicos**
+* Producer e Consumer em **EC2 (.NET)**
+* Consumer chamando **Lambda distribuidor**
+* Uso explícito de **tópicos, partições e consumer group**
+
+Vou dividir em **4 blocos grandes** para facilitar documentação e defesa arquitetural.
+
+---
+
+# 🧱 VISÃO GERAL DA ARQUITETURA (O TODO)
+
+Antes de entrar em Producer/Consumer, é essencial **fixar o modelo mental correto**:
+
+> **Kafka (MSK) é o sistema de coordenação e estado**
+> Producer e Consumer são **stateless**
+> Consumer Group é o **mecanismo de escala e resiliência**
+
+---
+
+## 📌 Arquitetura lógica (alto nível)
+
+```mermaid
+flowchart LR
+    subgraph AccountA["Conta A - Infra Kafka"]
+        MSK["Amazon MSK<br/>(Kafka Cluster)"]
+        T1["Tópico mt-c400<br/>(20+ Partições)"]
+        T2["Tópico mt-c300<br/>(8+ Partições)"]
+        MSK --> T1
+        MSK --> T2
+    end
+
+    subgraph AccountB["Conta B - Aplicações"]
+        P["Producer .NET<br/>(EC2)"]
+        C["Consumer .NET<br/>(EC2)"]
+        L["Lambda<br/>Distribuidor"]
+    end
+
+    P -->|Produce| MSK
+    MSK -->|Consume| C
+    C -->|Batch| L
+```
+
+---
+
+# 🧩 BLOCO 1 — MODELAGEM DE TÓPICOS E PARTIÇÕES (DECISÃO CHAVE)
+
+## 🎯 Objetivo
+
+* Permitir **13k msg/s**
+* Isolar domínios
+* Minimizar rebalance
+* Preparar crescimento
+
+---
+
+## 🔹 Estrutura proposta de tópicos
+
+| Tópico    | Função                    | Partições | Observação         |
+| --------- | ------------------------- | --------- | ------------------ |
+| `mt-c400` | Domínio mais quente (80%) | 20–40     | Alta paralelização |
+| `mt-c300` | Domínio médio             | 8–12      | Menor volume       |
+| Outros    | Específicos               | conforme  | Isolamento         |
+
+> ⚠️ Importante:
+> **Códigos NÃO viram tópicos**, eles viram **chaves de particionamento**
+
+---
+
+## 🔹 Regra de ouro
+
+> **Tópicos = contratos**
+> **Partições = paralelismo**
+> **Chave = ordem**
+
+---
+
+# 🧱 BLOCO 2 — PRODUCER .NET (EC2)
+
+## 🎯 Papel do Producer
+
+* Receber mensagens de várias fontes
+* Decidir:
+
+  * **Qual tópico**
+  * **Qual chave**
+* Nunca decidir consumer, partição manual ou offset
+
+---
+
+## 🔁 Fluxo completo do Producer
+
+```mermaid
+flowchart TD
+    START["Start Producer Service"]
+    LOADCFG["Load Config<br/>(Tópicos, Brokers, TLS)"]
+    TLS["Load Certificado<br/>(mTLS via S3)"]
+    INIT["Init Kafka Producer<br/>(.NET)"]
+
+    LOOP["Loop de Produção"]
+    BUILD["Build Mensagem JSON"]
+    SELECT["Selecionar Tópico<br/>(mt-c400 / mt-c300)"]
+    KEY["Definir Message Key<br/>(código / deviceId)"]
+    SEND["ProduceAsync()"]
+    ACK{"ACK OK?"}
+    RETRY["Retry / DLQ"]
+    METRIC["Emitir Métricas"]
+
+    START --> LOADCFG --> TLS --> INIT --> LOOP
+    LOOP --> BUILD --> SELECT --> KEY --> SEND --> ACK
+    ACK -- Sim --> METRIC --> LOOP
+    ACK -- Não --> RETRY --> LOOP
+```
+
+---
+
+## 🔹 Como o Producer decide partição (conceito crítico)
+
+### ❌ O que NÃO fazer
+
+* Não escolher partição manualmente
+* Não tentar “balancear na mão”
+* Não criar lógica distribuída customizada
+
+### ✅ O que fazer
+
+* **Definir a `Message.Key`**
+* Kafka decide a partição via **hash da key**
+
+```csharp
+var message = new Message<string, string>
+{
+    Key = codigoOuDeviceId,
+    Value = json
+};
+
+await producer.ProduceAsync("mt-c400", message);
+```
+
+---
+
+## 🔹 Por que isso é correto?
+
+* Garante ordem por chave
+* Permite aumento de partições
+* Mantém producer simples
+* Evita dependência do MSK
+
+---
+
+## ⚠️ Pontos perigosos no Producer
+
+| Risco               | Mitigação                      |
+| ------------------- | ------------------------------ |
+| Hot partition       | Escolher chave bem distribuída |
+| Burst de produção   | Buffer interno do Kafka        |
+| Falha de broker     | ACK + retry                    |
+| Certificado vencido | Rotação via S3                 |
+
+---
+
+# 🧱 BLOCO 3 — CONSUMER .NET + CONSUMER GROUP
+
+## 🎯 Papel do Consumer
+
+* Ler em paralelo
+* Preservar ordem por partição
+* Batching
+* Chamar Lambda
+* Commit manual
+
+---
+
+## 🔹 Consumer Group como unidade lógica
+
+```mermaid
+flowchart LR
+    subgraph Kafka["MSK"]
+        T["Tópico mt-c400"]
+        P0["P0"]
+        P1["P1"]
+        P2["P2"]
+        P3["P3"]
+        T --> P0 --> P1 --> P2 --> P3
+    end
+
+    subgraph CG["Consumer Group: mt-c400-group"]
+        C1["EC2 Consumer #1"]
+        C2["EC2 Consumer #2"]
+        C3["EC2 Consumer #3"]
+    end
+
+    P0 --> C1
+    P1 --> C2
+    P2 --> C3
+    P3 --> C1
+```
+
+> Kafka garante:
+> **1 partição → 1 consumer ativo**
+
+---
+
+## 🔁 Fluxo interno do Consumer
+
+```mermaid
+flowchart TD
+    START["Start Consumer"]
+    LOADCFG["Load group.id"]
+    TLS["Load mTLS Cert"]
+    SUB["Subscribe Topics"]
+    POLL["Poll()"]
+    BUFFER["Buffer Mensagens"]
+    CHECK{"Batch<br/>ou Timeout?"}
+    CALL["Invoke Lambda"]
+    COMMIT["Commit Offset"]
+    ERROR["Retry / Backoff"]
+
+    START --> LOADCFG --> TLS --> SUB --> POLL
+    POLL --> BUFFER --> CHECK
+    CHECK -- Não --> POLL
+    CHECK -- Sim --> CALL
+    CALL -- OK --> COMMIT --> POLL
+    CALL -- Fail --> ERROR --> POLL
+```
+
+---
+
+## 🔹 Por que usar Consumer Group
+
+* Escala horizontal automática
+* Rebalance em falha
+* Estado fora da aplicação
+* Deploy seguro
+
+---
+
+# 🧱 BLOCO 4 — LAMBDA DISTRIBUIDOR
+
+## 🎯 Papel do Lambda
+
+* NÃO consumir Kafka
+* NÃO manter estado
+* Apenas:
+
+  * Roteamento
+  * Fan-out
+  * Enriquecimento
+
+---
+
+```mermaid
+flowchart LR
+    C["Consumer EC2"]
+    L["Lambda Distribuidor"]
+    S1["Serviço A"]
+    S2["Serviço B"]
+    S3["Serviço C"]
+
+    C -->|Batch JSON| L
+    L --> S1
+    L --> S2
+    L --> S3
+```
+
+---
+
+## ⚠️ Trade-off consciente
+
+* Lambda lento → lag sobe
+* Nenhuma perda
+* Backpressure natural
+
+---
+
+# 🧠 AMARRAÇÃO FINAL (PARA DOCUMENTAÇÃO)
+
+## O que essa arquitetura FAZ bem
+
+* Escala horizontal
+* Tolera falhas
+* Isola responsabilidades
+* Permite crescimento sem refatoração
+
+## O que ela NÃO tenta fazer
+
+* Ordem global
+* Latência zero
+* Processamento síncrono fim-a-fim
+
+---
+
+## 📌 Frase de ouro para fechar
+
+> O Kafka é o cérebro do sistema.
+> Producer injeta eventos.
+> Consumer Group processa em paralelo.
+> Lambda distribui.
+>
+> Nenhuma peça sabe demais sobre a outra.
+
+---
