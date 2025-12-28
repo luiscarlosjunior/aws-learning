@@ -1020,3 +1020,479 @@ Posso:
 Se quiser, diga:
 👉 *“Vamos detalhar o código do Producer”*
 
+Perfeito. Vou te entregar **dois diagramas complementares**, no nível que normalmente aparece em **documentação de arquitetura séria**:
+
+1. **Diagrama arquitetural do Producer (visão estrutural)**
+2. **Fluxograma detalhado de execução do Producer (visão comportamental)**
+
+Ambos pensados para:
+
+* Sustentar discussão com arquitetos, SRE e FinOps
+* Ajudar alguém a **construir o serviço do zero**
+* Deixar explícito **onde estão os riscos e controles**
+
+---
+
+# 🧱 1️⃣ Diagrama Arquitetural do Serviço Producer (.NET em EC2)
+
+👉 **Pergunta que esse diagrama responde**
+
+> “Que componentes existem dentro do Producer e como eles se relacionam?”
+
+```mermaid
+flowchart LR
+    subgraph EC2["EC2 Producer (.NET)"]
+        CFG["Config Loader<br/>(ENV / AppSettings)"]
+        GEN["Message Generator<br/>(Simula fontes)"]
+        ROUTER["Topic Router<br/>(Regra por código)"]
+        KEY["Key Resolver<br/>(hash(codigo+truck))"]
+        KPROD["Kafka Producer<br/>(librdkafka)"]
+        MET["Metrics & Logs<br/>(CloudWatch / OTEL)"]
+        RATE["Rate Limiter<br/>(TPS / Bytes)"]
+    end
+
+    subgraph MSK["Amazon MSK"]
+        T400["Topic mt-c400<br/>(N Partições)"]
+        T300["Topic mt-c300<br/>(M Partições)"]
+    end
+
+    CFG --> GEN
+    GEN --> ROUTER
+    ROUTER --> KEY
+    KEY --> RATE
+    RATE --> KPROD
+    KPROD --> T400
+    KPROD --> T300
+    KPROD --> MET
+    RATE --> MET
+```
+
+---
+
+## 📌 Como explicar esse diagrama em reunião
+
+* **Config Loader**
+  → Nada hardcoded. TPS, tópicos e comportamento são configuráveis.
+
+* **Message Generator**
+  → Simula múltiplas fontes e Pareto (80/20).
+
+* **Topic Router**
+  → Decide *qual domínio* (mt-c400, mt-c300).
+
+* **Key Resolver**
+  → Define *como Kafka irá distribuir*.
+
+* **Rate Limiter**
+  → Protege o MSK **e o próprio Producer**.
+
+* **Kafka Producer**
+  → Único ponto de comunicação com o cluster.
+
+* **Metrics**
+  → Sem isso, a POC não vale nada.
+
+---
+
+# 🔁 2️⃣ Fluxograma Detalhado do Producer (Execução passo a passo)
+
+👉 **Pergunta que esse fluxograma responde**
+
+> “O que acontece exatamente desde o start até o envio contínuo?”
+
+```mermaid
+flowchart TD
+    A[Start EC2 Producer] --> B[Load Configurations]
+    B --> C[Validate Configs]
+    C -->|Invalid| CERR[Fail Fast & Exit]
+    C -->|Valid| D[Init Kafka Producer]
+
+    D --> E[Init Metrics & Logs]
+    E --> F[Start Worker Threads]
+
+    F --> G[Generate Message]
+    G --> H[Extract Business Code]
+    H --> I[Resolve Topic]
+    I --> J[Resolve Partition Key]
+
+    J --> K[Rate Limit Check]
+    K -->|Exceeded| KWAIT[Wait / Sleep]
+    KWAIT --> K
+    K -->|Allowed| L[Produce Message]
+
+    L --> M{Ack Received?}
+    M -->|Yes| N[Update Metrics]
+    M -->|No| O[Retry Policy]
+
+    O -->|Retryable| L
+    O -->|Fatal| P[Log Error & Continue]
+
+    N --> G
+```
+
+---
+
+## 📌 Pontos críticos destacados no fluxograma
+
+### 🔴 Fail Fast
+
+* Se config errada → **não sobe**
+* Evita producer “zumbi”
+
+---
+
+### 🔴 Rate Limiter antes do Kafka
+
+* Kafka **não protege você**
+* Sem isso:
+
+  * Memória cresce
+  * Latência explode
+  * EC2 morre
+
+---
+
+### 🔴 Retry consciente
+
+* Nem todo erro é retryável
+* Erro de schema ≠ erro de rede
+
+---
+
+# ⚠️ Pontos perigosos explícitos no diagrama
+
+| Ponto             | Risco              | Mitigação         |
+| ----------------- | ------------------ | ----------------- |
+| Key mal escolhida | Hot partition      | Hash composta     |
+| Sem rate limit    | OOM                | Throttling        |
+| Retries infinitos | Loop infinito      | Retry com limite  |
+| Config fixa       | Impossível escalar | ENV vars          |
+| Métricas pobres   | Arquitetura “cega” | CloudWatch / OTEL |
+
+---
+
+# 🧠 Como um arquiteto sênior justificaria esse desenho
+
+> “Esse Producer não sabe nada sobre o MSK além do necessário. Ele declara intenção (tópico, chave, confiabilidade) e deixa o Kafka fazer o trabalho pesado. Isso reduz acoplamento, facilita escala e torna o comportamento previsível sob carga.”
+
+---
+
+# 📋 Checklist rápido (para POC)
+
+✔ Código configurável
+✔ Simulação Pareto
+✔ Métricas claras
+✔ Rate limit ativo
+✔ Chave bem definida
+✔ Fácil de escalar horizontalmente
+
+Perfeito. Abaixo está um **PLAYBOOK DE AUMENTO DE PARTIÇÕES KAFKA (MSK)**, escrito no nível que **SRE, arquiteto e time .NET** esperam ver.
+Ele cobre **quando fazer**, **impactos reais**, **o que esperar**, **como mitigar**, e **como o código .NET deve se comportar antes e depois**.
+
+Este material é **diretamente reutilizável** na sua documentação oficial.
+
+---
+
+# 📘 PLAYBOOK – Aumento de Partições em Kafka (MSK)
+
+## 🎯 Objetivo
+
+Permitir **aumento de throughput e paralelismo** sem downtime, mantendo:
+
+* previsibilidade operacional
+* impacto controlado
+* zero mudança no código do Producer/Consumer (.NET)
+
+---
+
+## 1️⃣ Quando aumentar partições (critérios objetivos)
+
+Você **NÃO aumenta partições por intuição**.
+Você aumenta quando **métricas indicam gargalo estrutural**.
+
+### Indicadores claros
+
+| Métrica                            | Sintoma                 |
+| ---------------------------------- | ----------------------- |
+| Consumer Lag cresce continuamente  | Capacidade insuficiente |
+| Apenas algumas partições saturadas | Hot partition           |
+| CPU de consumers < 50%             | Falta paralelismo       |
+| Throughput estagnado               | Limite físico           |
+| Escalar consumers não ajuda        | Falta partições         |
+
+👉 **Regra prática**
+
+> Número de partições ≥ número máximo esperado de consumers ativos
+
+---
+
+## 2️⃣ O que acontece tecnicamente ao aumentar partições
+
+### Estado ANTES
+
+```
+Topic mt-c400
+Partições: 8
+partition = hash(key) % 8
+```
+
+### Estado DEPOIS
+
+```
+Topic mt-c400
+Partições: 16
+partition = hash(key) % 16
+```
+
+### Efeitos imediatos
+
+✔ Mensagens antigas permanecem onde estão
+✔ Mensagens novas passam a usar novas partições
+⚠ A mesma key pode ir para outra partição
+⚠ Ordem histórica entre mensagens antigas e novas é quebrada
+
+👉 **Nada é perdido. Nada é duplicado.**
+
+---
+
+## 3️⃣ Impactos esperados (e normais)
+
+### 3.1 Rebalance do Consumer Group
+
+**O que acontece**
+
+* Todos os consumers pausam
+* Kafka redistribui partições
+* Consumo retoma
+
+**O que esperar**
+
+* Pausa de segundos (ou minutos se exagerou nas partições)
+* Lag temporário
+
+**Mitigação**
+
+* Aumentar partições fora do horário de pico
+* Garantir que consumers sejam idempotentes
+
+---
+
+### 3.2 Redistribuição de carga
+
+**Antes**
+
+```
+Partição 2 → 80% do tráfego
+```
+
+**Depois**
+
+```
+Partição 2 → 40%
+Partição 10 → 40%
+```
+
+👉 **Esse é o ganho esperado.**
+
+---
+
+### 3.3 Mudança invisível para o Producer
+
+✔ Producer não sabe
+✔ Producer não muda
+✔ Producer continua saudável
+
+**SE** você usou:
+
+* key-based partitioning
+* sem partição fixa no código
+
+---
+
+## 4️⃣ Riscos reais e como resolver
+
+### 🔥 RISCO 1 – Explosão de rebalance
+
+**Causa**
+
+* Muitas partições
+* Muitos consumers
+* Deploy frequente
+
+**Mitigação**
+
+* Evitar “partições demais”
+* Preferir scale-up antes de scale-out
+* Evitar restart em massa
+
+---
+
+### 🔥 RISCO 2 – Quebra de expectativa de ordem
+
+**Causa**
+
+* Key vai para outra partição
+
+**Mitigação**
+
+* Documentar claramente:
+
+  > “Ordem é garantida apenas após o resize”
+* Usar timestamp de evento
+
+---
+
+### 🔥 RISCO 3 – Hot partition continua
+
+**Causa**
+
+* Chave mal escolhida
+
+**Mitigação**
+
+```text
+ANTES: key = codigo
+DEPOIS: key = hash(codigo + truck_id)
+```
+
+---
+
+## 5️⃣ Como se preparar ANTES do aumento (obrigatório)
+
+### ✔ 1. Código .NET deve ser agnóstico a partições
+
+❌ ERRADO
+
+```csharp
+new TopicPartition("mt-c400", new Partition(3))
+```
+
+✔ CORRETO
+
+```csharp
+producer.Produce(
+    "mt-c400",
+    new Message<string, string>
+    {
+        Key = $"{codigo}:{truckId}",
+        Value = payload
+    }
+);
+```
+
+---
+
+### ✔ 2. Consumers devem ser idempotentes
+
+Após rebalance:
+
+* Mensagem pode ser reprocessada
+* Offset pode ser replayado
+
+👉 Lambda downstream deve suportar isso.
+
+---
+
+### ✔ 3. Métricas obrigatórias antes do resize
+
+* Consumer lag por partição
+* Rebalance time
+* Throughput por key
+* Ack latency do Producer
+
+---
+
+## 6️⃣ Passo a passo operacional (Playbook)
+
+### 🔹 PASSO 1 – Validar necessidade
+
+* Confirmar gargalo
+* Confirmar que mais consumers não resolvem
+
+---
+
+### 🔹 PASSO 2 – Escolher novo número
+
+Regra prática:
+
+```
+Novo N = 2x partições atuais
+```
+
+Evite:
+
+* Incrementos pequenos
+* Ajustes frequentes
+
+---
+
+### 🔹 PASSO 3 – Executar resize
+
+```bash
+kafka-topics.sh \
+  --bootstrap-server <broker> \
+  --alter \
+  --topic mt-c400 \
+  --partitions 16
+```
+
+✔ Sem downtime
+✔ Sem restart
+
+---
+
+### 🔹 PASSO 4 – Monitorar rebalance
+
+Acompanhar:
+
+* consumer-group-state
+* lag total
+* throughput
+
+---
+
+### 🔹 PASSO 5 – Validar estabilização
+
+Critério de sucesso:
+
+* Lag volta ao normal
+* CPU de consumers sobe
+* Throughput aumenta
+
+---
+
+## 7️⃣ O que NÃO fazer (anti-patterns)
+
+❌ Fixar partições no Producer
+❌ Criar lógica “partição dedicada” no código
+❌ Aumentar partições toda semana
+❌ Ignorar rebalance
+❌ Achar que aumento é “sem impacto”
+
+---
+
+## 8️⃣ Pergunta dura de SRE (simulação)
+
+### ❓ “Se dobrarmos as partições agora, o que pode dar errado?”
+
+**Resposta correta**
+
+> “Teremos um rebalance temporário e possível quebra de ordem histórica, mas nenhum impacto em integridade, perda de dados ou necessidade de mudança de código.”
+
+---
+
+## 9️⃣ Pergunta dura de arquiteto (simulação)
+
+### ❓ “Por que não criar outro tópico em vez de aumentar partições?”
+
+**Resposta madura**
+
+> “Porque o domínio não mudou. Só a capacidade. Partições escalam processamento, tópicos escalam contratos.”
+
+---
+
+## 🔚 Conclusão para documentação
+
+> “Aumentar partições é uma operação planejada, previsível e segura quando o Producer é key-based, os Consumers são idempotentes e o impacto é monitorado. O risco não está no Kafka, está em arquiteturas que acoplam código à topologia.”
+
+
