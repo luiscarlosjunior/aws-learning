@@ -3754,3 +3754,246 @@ Frase-chave:
 * Backpressure protege o cluster
 * Retry ≠ confiabilidade
 
+---
+
+# 🎯 OBJETIVO DO CONSUMER
+
+* Consumir **13.000 msg/s**
+* Manter **ordem por partição**
+* Garantir **at-least-once**
+* Controlar **custo de Lambda**
+* Isolar falhas
+* Ser escalável sem caos operacional
+
+---
+
+# 1️⃣ PRINCÍPIO FUNDAMENTAL (NÃO NEGOCIÁVEL)
+
+> ❗ **Nunca commitar offset antes do Lambda confirmar sucesso**
+
+Isso define **todo o desenho do consumer**.
+
+---
+
+# 2️⃣ MODELO DE ENTREGA CORRETO
+
+Kafka **não garante exatamente-once com Lambda**.
+Logo, a estratégia correta é:
+
+### ✅ **At-least-once + idempotência no Lambda**
+
+Por quê?
+
+* Falha de rede pode acontecer após o commit
+* Retry pode reprocessar mensagens
+* Lambda pode ser reexecutada
+
+➡ O Lambda **precisa aceitar duplicatas**.
+
+---
+
+# 3️⃣ ESTRATÉGIA DE CONSUMO (HIGH LEVEL)
+
+## Arquitetura correta:
+
+* **Consumer Group** único por aplicação
+* **N instâncias EC2** (scale horizontal)
+* Cada partição → 1 thread de consumo
+* Batch controlado
+* Commit manual
+
+---
+
+# 4️⃣ FLUXO DO CONSUMER (PASSO A PASSO)
+
+```text
+Kafka → Consumer → Buffer → Batch → Lambda → Ack → Commit
+```
+
+---
+
+# 5️⃣ ESTRATÉGIAS DE CHAMADA DO LAMBDA
+
+## ❌ Anti-pattern
+
+* 1 mensagem = 1 invoke
+* Alto custo
+* Latência alta
+* Throttling
+
+## ✅ Estratégia correta
+
+### 🔹 Batch + Async
+
+* Agrupar mensagens
+* Invocar Lambda com lote
+* Esperar confirmação
+* Commitar offset
+
+---
+
+# 6️⃣ CONFIGURAÇÕES CRÍTICAS DO CONSUMER (.NET)
+
+```csharp
+var config = new ConsumerConfig
+{
+    BootstrapServers = "...",
+    GroupId = "mt-c400-consumer",
+    EnableAutoCommit = false,
+    AutoOffsetReset = AutoOffsetReset.Earliest,
+    MaxPollRecords = 500,
+    SessionTimeoutMs = 45000,
+    MaxPollIntervalMs = 300000
+};
+```
+
+### Por quê?
+
+| Config                   | Motivo          |
+| ------------------------ | --------------- |
+| `EnableAutoCommit=false` | Controle total  |
+| `MaxPollRecords`         | Batch           |
+| `SessionTimeout`         | Evita rebalance |
+| `MaxPollInterval`        | Lambda lento    |
+
+---
+
+# 7️⃣ BATCHING (CHAVE PARA CUSTO E PERFORMANCE)
+
+## Estratégia recomendada:
+
+* Batch por:
+
+  * Tamanho (ex: 500 msgs)
+  * Tempo (ex: 200ms)
+* O que bater primeiro
+
+➡ Menos chamadas ao Lambda
+➡ Mais throughput
+
+---
+
+# 8️⃣ FLUXO DE ERRO DO CONSUMER
+
+### 🔴 Lambda falhou?
+
+| Tipo            | Ação    |
+| --------------- | ------- |
+| Timeout         | Retry   |
+| Erro 5xx        | Retry   |
+| Erro 4xx lógico | DLQ     |
+| Throttle        | Backoff |
+
+---
+
+# 9️⃣ ONDE FICA O DLQ DO CONSUMER?
+
+### Opções:
+
+* Tópico Kafka `mt-c400-dlq`
+* S3 (payload + metadata)
+* DynamoDB
+
+### Quando usar?
+
+* Payload inválido
+* Falha repetida no Lambda
+* Erro lógico irreversível
+
+---
+
+# 🔟 DIAGRAMA MERMAID – CONSUMER → LAMBDA
+
+```mermaid
+flowchart TD
+    A[Kafka Topic / Partition] --> B[Consumer Group]
+
+    B --> C[Consumer EC2]
+    C --> D[Poll Batch]
+
+    D --> E[Invoke Lambda Async]
+
+    E -->|Success| F[Commit Offset]
+    E -->|Retryable Error| G[Retry Buffer]
+    G --> D
+
+    E -->|Fatal Error| H[DLQ]
+
+    C -->|Slow Processing| I[Pause Partition]
+    I --> C
+```
+
+---
+
+# 1️⃣1️⃣ PAUSE / RESUME (ESSENCIAL)
+
+Kafka permite:
+
+```csharp
+consumer.Pause(consumer.Assignment);
+consumer.Resume(consumer.Assignment);
+```
+
+### Use quando:
+
+* Lambda está lento
+* Backpressure
+* Evitar rebalance
+
+---
+
+# 1️⃣2️⃣ ESCALABILIDADE DO CONSUMER
+
+## Regra de ouro:
+
+> **Máximo de consumidores ativos = número de partições**
+
+Ex:
+
+* 12 partições
+* 12 consumers (threads ou instâncias)
+
+---
+
+# 1️⃣3️⃣ COMO ISSO SE DEFENDE EM REVIEW
+
+### Pergunta dura:
+
+> “Por que EC2 e não Lambda consumindo direto?”
+
+Resposta:
+
+> Kafka exige conexão persistente, controle de offset e backpressure — Lambda não foi feita para isso.
+
+---
+
+### Pergunta dura:
+
+> “E se o consumer cair?”
+
+Resposta:
+
+> Outro consumer do grupo assume a partição, offsets garantem continuidade.
+
+---
+
+# 1️⃣4️⃣ PLAYBOOK DE INCIDENTES (CONSUMER)
+
+| Incidente            | Ação               |
+| -------------------- | ------------------ |
+| Lag crescendo        | Aumentar consumers |
+| Rebalance frequente  | Aumentar timeouts  |
+| Lambda throttle      | Reduz batch        |
+| Mensagens duplicadas | Idempotência       |
+
+---
+
+# 1️⃣5️⃣ RESUMO EXECUTIVO
+
+* Consumer define SLA
+* Commit manual é obrigatório
+* Batch reduz custo
+* DLQ protege estabilidade
+* Pause/resume evita caos
+* Idempotência é mandatória
+
