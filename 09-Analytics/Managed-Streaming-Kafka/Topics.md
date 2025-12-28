@@ -3028,3 +3028,729 @@ flowchart LR
 > Nenhuma peça sabe demais sobre a outra.
 
 ---
+Perfeito. Abaixo está **um diagrama Mermaid único, grande e didático**, focado **exatamente no que deve ser desenvolvido**, deixando **claras as responsabilidades do Producer, MSK (outra conta), Consumer Group, EC2 e Lambda**.
+
+👉 **Esse diagrama é para alinhar time, arquitetura e implementação**
+👉 **Não é conceitual — é operacional**
+
+---
+
+## 📐 Diagrama Mermaid – Arquitetura Exata a Ser Desenvolvida
+
+```mermaid
+flowchart LR
+    %% ======================
+    %% PRODUCER
+    %% ======================
+    subgraph PROD["Producer Application (.NET)"]
+        A1[Evento de Negócio\n(ex: Telemetria, Status, Alerta)]
+        A2[Define Tópico\n(mt-c400, mt-c300, ...)]
+        A3[Define Message Key\n(ex: truckId, deviceId)]
+        A4[Serializa Payload\n(JSON / Avro)]
+        A5[Producer Kafka (.NET)\nacks=all\nidempotent=true]
+    end
+
+    %% ======================
+    %% MSK OUTRA CONTA
+    %% ======================
+    subgraph MSK["Amazon MSK (Outra Conta AWS)"]
+        direction TB
+        T1[Tópico mt-c400]
+        
+        P1[Partição 0]
+        P2[Partição 1]
+        P3[Partição 2]
+        Pn[Partição N]
+
+        T1 --> P1
+        T1 --> P2
+        T1 --> P3
+        T1 --> Pn
+    end
+
+    %% ======================
+    %% CONSUMER GROUP
+    %% ======================
+    subgraph CG["Consumer Group: cg-dispatcher"]
+        direction TB
+        C1[Consumer 1\nEC2]
+        C2[Consumer 2\nEC2]
+        C3[Consumer 3\nEC2]
+    end
+
+    %% ======================
+    %% LAMBDA
+    %% ======================
+    subgraph L["AWS Lambda\nMessage Dispatcher"]
+        L1[Validação]
+        L2[Transformação]
+        L3[Roteamento por Tipo]
+    end
+
+    %% ======================
+    %% FLUXOS
+    %% ======================
+    A1 --> A2
+    A2 --> A3
+    A3 --> A4
+    A4 --> A5
+
+    A5 -->|TLS + Auth| T1
+
+    P1 -->|Assigned by Kafka| C1
+    P2 -->|Assigned by Kafka| C2
+    P3 -->|Assigned by Kafka| C3
+    Pn -->|Rebalance| C1
+
+    C1 -->|Invoke| L
+    C2 -->|Invoke| L
+    C3 -->|Invoke| L
+
+    %% ======================
+    %% OBSERVAÇÕES
+    %% ======================
+    classDef producer fill:#e3f2fd,stroke:#1e88e5
+    classDef kafka fill:#fff3e0,stroke:#fb8c00
+    classDef consumer fill:#e8f5e9,stroke:#43a047
+    classDef lambda fill:#f3e5f5,stroke:#8e24aa
+
+    class A1,A2,A3,A4,A5 producer
+    class T1,P1,P2,P3,Pn kafka
+    class C1,C2,C3 consumer
+    class L1,L2,L3 lambda
+```
+
+---
+
+## 🧭 COMO EXPLICAR ESSE DIAGRAMA PARA O TIME
+
+### 1️⃣ Producer (Responsabilidade Total do Time Externo)
+
+Eles **devem implementar SOMENTE isso**:
+
+* Escolher o **tópico**
+* Definir a **key corretamente**
+* Enviar mensagem confiável
+
+👉 **Eles NÃO sabem:**
+
+* Quantas partições existem
+* Quantos consumers existem
+* Como a mensagem será processada
+
+---
+
+### 2️⃣ MSK (Outra Conta – Limite de Atuação)
+
+* Vocês **não gerenciam brokers**
+* Vocês **não gerenciam consumer**
+* Só:
+
+  * criam tópicos
+  * definem partições
+  * definem ACLs
+
+---
+
+### 3️⃣ Consumer Group (Seu Domínio)
+
+* Kafka decide:
+
+  * qual consumer lê qual partição
+  * quando rebalancear
+* Consumers:
+
+  * rodam em EC2
+  * pertencem ao **mesmo group.id**
+
+👉 **Escala = subir EC2**
+👉 **Paralelismo = número de partições**
+
+---
+
+### 4️⃣ Lambda (Fan-out / Distribuição)
+
+* Consumer:
+
+  * lê
+  * confirma offset
+  * chama Lambda
+* Lambda:
+
+  * distribui
+  * transforma
+  * roteia
+
+👉 Lambda **não lê Kafka**
+👉 Kafka **não conhece Lambda**
+
+---
+
+## 🔑 MENSAGEM-CHAVE PARA O TIME
+
+> O Producer escreve eventos ordenados por key.
+> O Kafka distribui.
+> O Consumer Group escala.
+> A Lambda processa.
+
+---
+
+# 🎯 OBJETIVO DO PRODUCER
+
+> Publicar **13.000 msg/s**, JSON (~200 bytes), com:
+
+* **Alta disponibilidade**
+* **Entrega confiável**
+* **Baixa latência**
+* **Tolerância a falhas de rede, broker e rebalanceamento**
+
+Sem depender de acesso administrativo ao MSK.
+
+---
+
+# 1️⃣ TIPOS DE FALHAS QUE VOCÊ PRECISA ASSUMIR QUE VÃO ACONTECER
+
+Antes de soluções, **o que pode quebrar**:
+
+## 🔴 Falhas no Broker
+
+* Broker reinicia (patch, failover)
+* Leader de partição muda
+* ISR encolhe temporariamente
+* Throttling de I/O
+
+➡ Kafka **continua funcionando**, mas:
+
+* requests falham
+* latência aumenta
+* metadata fica inválida
+
+---
+
+## 🔴 Falhas de Rede
+
+* Latência intermitente (VPC, NACL, SG)
+* Packet loss
+* Timeout TLS
+* PrivateLink instável
+
+➡ Sintomas:
+
+* `RequestTimedOut`
+* `NotLeaderOrFollower`
+* `BrokerNotAvailable`
+
+---
+
+## 🔴 Falhas no Próprio Producer
+
+* GC pressionado
+* Buffer cheio
+* Backpressure
+* Thread pool saturado
+
+➡ Sintomas:
+
+* mensagens acumulando
+* `Local: Queue full`
+* aumento de latência
+
+---
+
+## 🔴 Falhas de Autenticação / TLS
+
+* Certificado expirado
+* Erro de truststore
+* Falha no handshake mTLS
+
+➡ Producer **não consegue conectar**
+
+---
+
+# 2️⃣ PRINCÍPIOS DE ROBUSTEZ (ESSENCIAIS)
+
+Esses princípios **não são opcionais**:
+
+| Princípio         | Por quê             |
+| ----------------- | ------------------- |
+| Idempotência      | Evitar duplicatas   |
+| Retry controlado  | Falhas transitórias |
+| Timeout explícito | Evitar deadlock     |
+| Backpressure      | Proteger memória    |
+| Observabilidade   | Saber que quebrou   |
+| Shutdown gracioso | Evitar perda        |
+
+---
+
+# 3️⃣ CONFIGURAÇÕES CRÍTICAS DO PRODUCER (.NET)
+
+Usando `Confluent.Kafka`.
+
+## 🔹 Configurações Básicas (Obrigatórias)
+
+```csharp
+var config = new ProducerConfig
+{
+    BootstrapServers = "...",
+
+    SecurityProtocol = SecurityProtocol.Ssl,
+    SslKeystoreLocation = "/tmp/client.p12",
+    SslKeystorePassword = "",
+    SslKeyPassword = "",
+
+    Acks = Acks.All,               // 🔐 garante escrita em todos os replicas
+    EnableIdempotence = true,      // 🔐 evita duplicatas
+    MessageSendMaxRetries = 5,
+    RetryBackoffMs = 200,
+    LingerMs = 5,
+    BatchSize = 64 * 1024,         // batching
+};
+```
+
+### ❗ Por que isso é crítico?
+
+| Config             | O que resolve       |
+| ------------------ | ------------------- |
+| `acks=all`         | Perda silenciosa    |
+| `idempotence=true` | Duplicação em retry |
+| `linger.ms`        | Throughput          |
+| `batch.size`       | Menos syscalls      |
+| `retry`            | Falhas transitórias |
+
+---
+
+# 4️⃣ TRATAMENTO DE ERROS (NÃO OPCIONAL)
+
+## 🔹 Erros Retriáveis (devem ser reprocessados)
+
+| Erro Kafka            | Motivo             |
+| --------------------- | ------------------ |
+| `RequestTimedOut`     | Latência           |
+| `NotLeaderOrFollower` | Rebalance          |
+| `BrokerNotAvailable`  | Broker reiniciando |
+
+### Estratégia:
+
+* Retry automático
+* Backoff exponencial
+* Métrica de retry
+
+---
+
+## 🔹 Erros FATAIS (não adianta retry)
+
+| Erro                   | Ação          |
+| ---------------------- | ------------- |
+| `AuthenticationFailed` | Alertar       |
+| `SslHandshakeFailed`   | Falha de cert |
+| `InvalidConfiguration` | Fail fast     |
+
+---
+
+## 🔹 Código de Tratamento
+
+```csharp
+producer.Produce(topic, message, report =>
+{
+    if (report.Error.IsError)
+    {
+        if (report.Error.IsFatal)
+        {
+            // Circuit breaker / alert
+        }
+        else
+        {
+            // Retry ou métricas
+        }
+    }
+});
+```
+
+---
+
+# 5️⃣ BACKPRESSURE (ESSENCIAL PARA NÃO QUEBRAR O SERVIÇO)
+
+Sem isso, seu Producer **morre sob carga**.
+
+## 🔹 O problema
+
+* Kafka fica lento
+* Producer continua aceitando mensagens
+* Memória explode
+
+## 🔹 Solução
+
+* `QueueBufferingMaxMessages`
+* `QueueBufferingMaxKbytes`
+
+```csharp
+QueueBufferingMaxMessages = 100_000,
+QueueBufferingMaxKbytes = 100_000
+```
+
+### Estratégia adicional
+
+* Pausar entrada de mensagens
+* Rejeitar requests upstream
+* Shed load
+
+---
+
+# 6️⃣ METADATA E REBALANCE (VOCÊ PRECISA SABER)
+
+Quando:
+
+* partição aumenta
+* broker cai
+* leader muda
+
+➡ Producer:
+
+* invalida metadata
+* refaz lookup
+* pode falhar temporariamente
+
+### Por isso:
+
+* Retry + timeout curto
+* Logs claros
+
+---
+
+# 7️⃣ CERTIFICADOS (ROBUSTEZ DE SEGURANÇA)
+
+Você já tem S3 → mTLS, mas atenção:
+
+## 🔹 Problemas comuns
+
+* Cert expira
+* Rotação não sincronizada
+* Producer não recarrega cert
+
+### Estratégia
+
+* Validar validade no startup
+* Reload controlado
+* Healthcheck falha se cert inválido
+
+---
+
+# 8️⃣ SHUTDOWN GRACIOSO (MUITO ESQUECIDO)
+
+Sem isso:
+
+* mensagens em buffer são perdidas
+
+## 🔹 Obrigatório
+
+```csharp
+producer.Flush(TimeSpan.FromSeconds(10));
+producer.Dispose();
+```
+
+E:
+
+* SIGTERM handling
+* timeout máximo
+
+---
+
+# 9️⃣ OBSERVABILIDADE (SEM ISSO VOCÊ NÃO DEFENDE A ARQUITETURA)
+
+## Métricas obrigatórias
+
+| Métrica         | Por quê       |
+| --------------- | ------------- |
+| msgs/sec        | Throughput    |
+| latency produce | SLA           |
+| retries         | Instabilidade |
+| errors          | Incidentes    |
+| queue size      | Backpressure  |
+
+Confluent expõe via:
+
+* StatisticsHandler
+* Prometheus
+
+---
+
+# 🔟 DIAGRAMA – ROBUSTEZ DO PRODUCER
+
+```mermaid
+flowchart TD
+    A[Evento] --> B[Serialize]
+    B --> C[Producer Buffer]
+
+    C -->|Batch| D[Kafka Broker]
+    D -->|Ack| C
+
+    D -->|Timeout| E[Retry Backoff]
+    E --> C
+
+    D -->|Fatal Error| F[Circuit Breaker]
+    F --> G[Alert / Stop]
+
+    C -->|Queue Full| H[Backpressure]
+    H --> I[Reject / Slow Down]
+```
+
+---
+
+# 🔥 COMO DEFENDER ISSO NUM REVIEW
+
+Se alguém perguntar:
+
+> "Por que tanta configuração?"
+
+Resposta:
+
+> Porque Kafka **não falha como banco**.
+> Ele degrada, reequilibra e se recupera —
+> e o Producer precisa sobreviver a isso sem perder dados.
+
+---
+
+# 📌 RESUMO EXECUTIVO (PARA DOCUMENTAÇÃO)
+
+* Producer é **stateful**
+* Falhas são **esperadas**
+* Retry sem idempotência é **erro grave**
+* Backpressure é **obrigatório**
+* Observabilidade é **parte da arquitetura**
+* Robustez ≠ latência zero
+
+Perfeito — agora vamos **subir o nível para arquitetura de produção real**, no detalhe que **SRE, Arquiteto Chefe e FinOps esperam ver**.
+
+Vou te entregar:
+
+1. **Modelo conceitual de erro / retry / DLQ**
+2. **Fluxo detalhado de decisão**
+3. **O que é retry válido vs erro definitivo**
+4. **Onde o DLQ entra (mesmo para Producer)**
+5. **Diagrama Mermaid bem detalhado**
+6. **Como defender isso em review**
+
+---
+
+# 1️⃣ CONCEITO-CHAVE: PRODUCER NÃO É “FIRE AND FORGET”
+
+Em sistemas críticos:
+
+> ❌ Producer **não pode** simplesmente falhar silenciosamente
+> ❌ Retry infinito **não é aceitável**
+> ❌ Erro não tratado vira **incidente de produção**
+
+Por isso, usamos **3 camadas**:
+
+1. **Retry em memória**
+2. **Retry persistido**
+3. **DLQ (Dead Letter Queue)**
+
+---
+
+# 2️⃣ TIPOS DE ERRO (CLASSIFICAÇÃO OBRIGATÓRIA)
+
+## 🔹 1. Erros Transientes (RETRY)
+
+| Erro Kafka            | Causa              |
+| --------------------- | ------------------ |
+| `RequestTimedOut`     | Latência           |
+| `NotLeaderOrFollower` | Rebalance          |
+| `BrokerNotAvailable`  | Broker reiniciando |
+| `NetworkException`    | Intermitência      |
+
+➡ **Retry com backoff**
+
+---
+
+## 🔹 2. Erros Lógicos / Irrecuperáveis (DLQ)
+
+| Erro                 | Motivo          |
+| -------------------- | --------------- |
+| JSON inválido        | Bug upstream    |
+| Schema incompatível  | Evolução errada |
+| Tópico inexistente   | Config          |
+| Certificado inválido | Segurança       |
+
+➡ **Não adianta retry**
+
+---
+
+## 🔹 3. Erros Temporários de Negócio (Retry Persistido)
+
+Ex:
+
+* Downstream fora do ar
+* Lambda indisponível
+* Rate limit
+
+➡ Retry com **persistência**
+
+---
+
+# 3️⃣ ARQUITETURA DE RETRY (BOAS PRÁTICAS)
+
+### ❌ Anti-pattern
+
+* Retry infinito em memória
+* Thread bloqueada
+* Backpressure global
+
+### ✅ Padrão correto
+
+* Retry com limite
+* Backoff exponencial
+* Persistência após N tentativas
+
+---
+
+# 4️⃣ ONDE ENTRA O DLQ NO PRODUCER?
+
+> “Mas Producer precisa de DLQ?”
+
+**Sim**, quando:
+
+* Mensagem é inválida
+* Schema não bate
+* Política impede envio
+
+O DLQ:
+
+* Pode ser outro tópico Kafka
+* Pode ser S3
+* Pode ser DynamoDB
+
+---
+
+# 5️⃣ FLUXO COMPLETO: ERRO → RETRY → DLQ
+
+## 🔹 Etapas
+
+1. Recebe evento
+2. Valida schema
+3. Serializa
+4. Envia ao Kafka
+5. Avalia retorno
+6. Retry?
+7. Persistir?
+8. DLQ?
+
+---
+
+# 6️⃣ DIAGRAMA MERMAID – ERRO / RETRY / DLQ (DETALHADO)
+
+```mermaid
+flowchart TD
+    A[Evento de Entrada] --> B[Validação / Schema]
+    
+    B -->|Inválido| DLQ[DLQ - Tópico / S3]
+    B -->|Válido| C[Serialize]
+
+    C --> D[Producer Buffer]
+
+    D -->|Send| E[Kafka Broker]
+
+    E -->|Ack OK| F[Sucesso]
+
+    E -->|Erro Transiente| G[Retry em Memória]
+    G -->|Tentativas < N| D
+    G -->|Tentativas >= N| H[Persistir Retry]
+
+    H --> I[Retry Scheduler]
+    I --> D
+
+    E -->|Erro Fatal| DLQ
+
+    D -->|Queue Full| J[Backpressure]
+    J --> K[Throttle / Reject]
+
+    style DLQ fill:#ffdddd,stroke:#cc0000,stroke-width:2px
+```
+
+---
+
+# 7️⃣ BACKOFF (COMO FAZER DIREITO)
+
+### Exemplo:
+
+* Retry 1: 100ms
+* Retry 2: 500ms
+* Retry 3: 1s
+* Retry 4: 5s
+* Retry 5: DLQ
+
+➡ Evita:
+
+* Thundering herd
+* Saturação do broker
+
+---
+
+# 8️⃣ EXEMPLO DE DECISÃO EM C# (SIMPLIFICADO)
+
+```csharp
+try
+{
+    producer.Produce(topic, msg);
+}
+catch (ProduceException e) when (e.Error.IsRetriable)
+{
+    RetryWithBackoff(msg);
+}
+catch (ProduceException e)
+{
+    SendToDLQ(msg, e);
+}
+```
+
+---
+
+# 9️⃣ PERGUNTAS DURAS QUE ISSO RESPONDE
+
+### 🔥 SRE:
+
+> “O que acontece se o broker ficar 30s fora?”
+
+✔ Retry controlado
+✔ Backpressure
+✔ Nenhuma perda silenciosa
+
+---
+
+### 🔥 Arquiteto:
+
+> “Como você evita retry infinito?”
+
+✔ Limite de tentativas
+✔ Persistência
+✔ DLQ
+
+---
+
+### 🔥 FinOps:
+
+> “Isso explode custo?”
+
+✔ Retry é local
+✔ DLQ é exceção
+✔ Batch reduz chamadas
+
+---
+
+# 🔟 COMO DEFENDER ESSA ARQUITETURA
+
+Frase-chave:
+
+> “Retry sem classificação de erro é bug, não robustez.”
+
+---
+
+# 📌 RESUMO EXECUTIVO
+
+* Nem todo erro merece retry
+* Retry infinito derruba sistemas
+* DLQ é **instrumento de observabilidade**
+* Producer também precisa de DLQ
+* Backpressure protege o cluster
+* Retry ≠ confiabilidade
+
